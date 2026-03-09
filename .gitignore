@@ -1,0 +1,18 @@
+*.dump
+
+/mac_capture/_build/
+/mac_capture/deps/
+
+# Firmware analysis
+/firmware/.venv/
+/firmware/apk/
+/firmware/binaries/
+/firmware/disassembly/
+/firmware/extracted/
+/firmware/il2cpp/lib/
+/firmware/il2cpp/assets/
+/firmware/il2cpp/output/dump.cs
+/firmware/il2cpp/output/il2cpp.h
+/firmware/il2cpp/output/script.json
+/firmware/il2cpp/output/stringliteral.json
+/firmware/il2cpp/output/DummyDll/

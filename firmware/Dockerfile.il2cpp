@@ -1,0 +1,12 @@
+FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/runtime:6.0
+
+RUN apt-get update && apt-get install -y wget unzip && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q https://github.com/Perfare/Il2CppDumper/releases/download/v6.7.46/Il2CppDumper-net6-v6.7.46.zip \
+    -O /tmp/il2cpp.zip && \
+    mkdir -p /opt/il2cpp && \
+    unzip /tmp/il2cpp.zip -d /opt/il2cpp && \
+    rm /tmp/il2cpp.zip
+
+WORKDIR /work
+ENTRYPOINT ["dotnet", "/opt/il2cpp/Il2CppDumper.dll"]
