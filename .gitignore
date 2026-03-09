@@ -1,7 +1,12 @@
 *.dump
 
+# tag capture and cloning
 /mac_capture/_build/
 /mac_capture/deps/
+
+# smart brick BLE interactions
+/smart_brick/_build/
+/smart_brick/deps/
 
 # Firmware analysis
 /firmware/.venv/
