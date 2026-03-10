@@ -73,6 +73,38 @@ Identity = minifigure/character tag. Item = vehicle/weapon tile.
 
 7. **Done** — the tool reports how many blocks succeeded/failed.
 
+## Custom experiments (NfcCustomClone)
+
+For low-level experiments, `mac_capture` also includes an **experimental** custom clone tool:
+
+- `NfcCustomClone` can load a saved tag, truncate it to a target sticker size (e.g. 28 blocks for a 112-byte sticker), and rewrite **block 0** so the header’s payload length and capacity match what will actually be written.
+- It can also apply arbitrary block 0 hex or send a fully custom `CLONE:<hex>` payload.
+
+Run it from the `mac_capture` directory:
+
+```bash
+mix run -e "NfcCustomClone.run()"
+```
+
+This is useful for experiments like **Lightsaber on a 112-byte sticker**: truncate the tag to 28 blocks, fix the header to the new payload length and capacity, and see whether the smart brick starts recognizing the truncated tag (testing how strictly it validates the header fields).
+
+**Result (Lightsaber truncate + fix header):** A truncated Lightsaber (28 blocks) with block 0 rewritten to payload length 108 and capacity 112 was written successfully to a blank sticker. The smart brick **still did not recognize** the tag (same “does nothing” behaviour as the earlier partial write). So fixing the header to match the written data is not sufficient. The brick likely validates the **encrypted payload** (e.g. AES-CCM MAC over the full ciphertext) or expects the full payload; truncating the ciphertext leaves it invalid, so the tag is ignored.
+
+**Capacity field (bytes 2–3 of block 0):** On a 112-byte sticker, writing X-Wing with **modified** block 0 (payload 107, capacity 112 = `006B0070`) was **not** recognized by the brick; a **straight copy** (same 28 blocks but capacity left as 268 = `006B010C`) **was** recognized. So the brick appears to **require capacity 0x010C (268)** in the header; changing it to the physical tag size breaks recognition. When cloning tags that fit in 28 blocks to a 112-byte sticker, keep the original block 0 (including 0x010C) and only truncate the block list — do not rewrite capacity to 112. The custom-clone "truncate to sticker" experiment now keeps the original capacity for this reason.
+
+**Payload length (bytes 0–1 of block 0):** A clean test with X-Wing payload and block 0 set to `0000010C` (payload length 0, capacity 268), written to a fully zero-padded 28-block sticker, was **not** recognized by the brick. So the brick **requires a proper (non-zero) payload length** in the header; it does not accept 0. **Wrong non-zero value:** With block 0 set to `000F010C` (payload length 15 instead of 107), the brick **flashed red continuously** — a distinct error indication it never showed for other invalid tags (which it simply ignored). So the brick appears to validate bytes 0–1 and signal an error when the value is wrong but non-zero (e.g. it may read that many bytes then fail decryption/MAC or structure checks). **Payload length vs content ID:** X-Wing and Tie Fighter both have 0x006B (107) in bytes 0–1; they also both have 107-byte payloads, which fits the payload-length interpretation. If bytes 0–1 were a content/type ID (as sometimes guessed elsewhere), two different items would likely have different IDs; the fact that two different tiles share 0x006B is consistent with length (same payload size) and would be a coincidence if it were an ID. So the payload-length interpretation remains the best fit.
+
+### Further experiment ideas (NfcCustomClone)
+
+All of these use experiment **3** (custom block 0) or **4** (raw hex); pad to 28 blocks when prompted so the sticker is fully overwritten and reusable.
+
+- **Payload length off-by-one:** X-Wing (107 bytes payload). Try block 0 `006A010C` (106) and `006C010C` (108). **Result:** Both 106 and 108 are ignored (no red flash); exact length 107 is required for recognition. Only a very wrong value (e.g. 15) caused red flash.
+- **Capacity near-miss:** Keep X-Wing payload and 107 length; try bytes 2–3 = `010B` or `010D` (268±1). **Result:** Both are ignored (no red flash); capacity must be exactly 0x010C (268) for recognition.
+- **Single-byte flip in ciphertext:** Use experiment **5** (flip one bit in a payload block): pick a tag (e.g. X-Wing), choose block index (default 5), byte 0–3 and bit 0–7 to flip. The tool writes the modified dump so you can test whether the brick ignores (MAC fail) or red-flashes. No need to paste raw hex. **Result:** One bit flipped in a payload block (e.g. block 3, byte 0) → brick **ignores** the tag (no red flash). So MAC (or integrity) failure is silent, unlike a wrong header value which can trigger red flash.
+- **Swap headers between tag types:** Write Tie Fighter payload (blocks 1–28) with Vader’s block 0 (`00A9010C`, length 169). Brick would try to read 169 bytes from a 28-block tag (only 108 bytes). **Result:** Tag is **ignored** (no red flash). Declared length 169 with only 108 bytes of payload is treated like other invalid payloads (silent ignore).
+- **Maximum payload length value:** Block 0 `FFFF010C` (65535) with 28 blocks (108 bytes). **Result:** Tag is **ignored** (no red flash). So an absurd length value is treated like other invalid payloads, not a distinct error.
+- **R2-D2 with wrong length:** R2-D2 has 74-byte payload (`004A010C`). Try 73 or 75. **Result:** 75 (`004B010C`) is **ignored** (no red flash), same as X-Wing off-by-one.
+
 ### What happens under the hood
 
 1. The Elixir app loads all `.jsonl` files from `data/`, deduplicates by payload content, and shows a menu.

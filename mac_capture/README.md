@@ -62,6 +62,23 @@ Show Arduino debug lines during cloning:
 mix run -e "NfcClone.run(debug: true)"
 ```
 
+### Experimental: custom clone / header experiments
+
+`NfcCustomClone` is an experimental tool for low-level clone experiments. It lets you:
+
+- Pick a saved tag dump.
+- Optionally truncate it to a given number of blocks (e.g. 28 for 112-byte stickers) and rewrite block 0 (payload length / capacity) accordingly.
+- Apply custom block 0 hex.
+- Or send a raw hex payload as `CLONE:<hex>`.
+
+Run:
+
+```bash
+mix run -e "NfcCustomClone.run()"
+```
+
+This is intended for experiments like rewriting the Lightsaber header to match what fits on a 112-byte sticker and seeing how the brick reacts. For normal cloning, prefer `NfcClone.run/1`.
+
 ## List ports
 
 To see available serial ports (e.g. to find the Arduino):

@@ -47,6 +47,7 @@ The tag chip is **NOT NXP** — it's made by **EM Microelectronic**. The EM4233 
 - **Bytes 0–1 (per-tag): `00A9` / `006B`** — **Payload length in bytes**: 0xA9 = **169**, 0x6B = **107**.
   - Vader: 43 blocks of data = 172 bytes; 172 − 169 = **3 bytes padding** (e.g. the trailing `00 00 00` of the last data block `3F000000`).
   - Tie Fighter: 27 blocks = 108 bytes; 108 − 107 = **1 byte padding**.
+  - **Validation:** Wrong but non-zero (e.g. `000F010C`, length 15) causes the brick to **flash red continuously** (error), unlike invalid/ignored tags. Length 0 → no reaction. So the brick uses bytes 0–1 and signals when they are wrong. X-Wing and Tie Fighter both have 0x006B (107); both have 107-byte payloads, so this fits “payload length”. If it were a content/type ID, two different items sharing the same value would be a coincidence; as length it is not.
 - So block 0 is: **[payload_len_hi, payload_len_lo, total_size_hi, total_size_lo]** with total size fixed at 268 bytes and payload length varying; the rest is padding (`00000000` blocks and trailing bytes in the last data block).
 
 ### Confirmed with 11 tags from hardware.md
@@ -101,7 +102,7 @@ Since tag data is openly readable, identical across same-type tags, and not UID-
 
 - **Byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically to the original. The blank need not be the same chip as LEGO (EM4233, `E016`); blanks with different UIDs or vendors (e.g. `E004`) work.
 - The clone tool writes only the data blocks (stripping trailing zero filler and `0001` end markers).
-- Factory tags are permanently write-locked, so you need blank writable stickers. Smaller stickers (e.g. 112 bytes = 28 blocks) work for tags that fit (R2-D2, Tie Fighter, X-Wing). If a tag is too large for the sticker (partial write), the brick ignores the tag entirely — no error, no crash.
+- Factory tags are permanently write-locked, so you need blank writable stickers. Smaller stickers (e.g. 112 bytes = 28 blocks) work for tags that fit (R2-D2, Tie Fighter, X-Wing). If a tag is too large for the sticker (partial write), the brick ignores the tag entirely — no error, no crash. **Truncate + fix header:** Writing a truncated tag (e.g. Lightsaber to 28 blocks) with block 0 updated to the new payload length and capacity still did not make the brick recognize it; the brick likely validates the full encrypted payload (e.g. AES-CCM MAC) rather than trusting the header alone. **Capacity field:** The brick appears to require block 0 bytes 2–3 to be **0x010C** (268). On a 112-byte sticker, X-Wing with capacity changed to 112 (`006B0070`) was rejected; the same 28 blocks with original capacity 268 (`006B010C`) was accepted. So when cloning to smaller stickers, keep the original header (do not rewrite capacity to the physical tag size). (The “truncated header” test with payload length 0: a clean test (zero-padded sticker) was rejected; the brick requires a non-zero payload length in the header.)
 
 See [cloning-guide.md](cloning-guide.md) for the practical workflow.
 
