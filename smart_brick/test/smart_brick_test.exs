@@ -3,6 +3,7 @@ defmodule SmartBrickTest do
 
   alias SmartBrick.Constants
   alias SmartBrick.Protocol
+  alias SmartBrick.FileTransfer
 
   describe "Constants" do
     test "register_byte/name round-trip" do
@@ -20,8 +21,8 @@ defmodule SmartBrickTest do
       assert Constants.volume_level(:low) == 10
     end
 
-    test "subscription_uuids returns 6 UUIDs" do
-      assert length(Constants.subscription_uuids()) == 6
+    test "subscription_uuids returns 5 UUIDs" do
+      assert length(Constants.subscription_uuids()) == 5
     end
   end
 
@@ -85,6 +86,42 @@ defmodule SmartBrickTest do
 
     test "parse_volume extracts first byte" do
       assert Protocol.parse_volume(<<40>>) == 40
+    end
+  end
+
+  describe "FileTransfer" do
+    test "build_request produces 12-byte packet" do
+      assert byte_size(FileTransfer.build_request(0)) == 12
+      assert <<0x01, 0x03, _::binary>> = FileTransfer.build_request(3)
+    end
+
+    test "build_confirm produces 3-byte packet" do
+      assert FileTransfer.build_confirm(2) == <<0x05, 0x02, 0x00>>
+    end
+
+    test "parse_ftc recognizes ack, end, confirm_ack" do
+      assert FileTransfer.parse_ftc(<<0x02, 0x03, 0x00, 0x00, 0x00, 0x30, 0x00>>) == {:ack, 0x03}
+      assert FileTransfer.parse_ftc(<<0x0A, 0x03, 0x00>>) == {:end, 0x03}
+      assert FileTransfer.parse_ftc(<<0x06, 0x03, 0x00, 0x00>>) == {:confirm_ack, 0x03}
+      assert FileTransfer.parse_ftc(<<0x99>>) == :unknown
+    end
+
+    test "parse_file_entry parses 40-byte entry" do
+      # handle=1, perms=0x200, size=100, name 16 bytes, version 16 bytes
+      name_16 = String.pad_trailing("Firmware", 16, "\0")
+      version_16 = String.pad_trailing("1.0", 16, "\0")
+      bin = <<1::little-16, 0x200::little-16, 100::little-32, name_16::binary, version_16::binary>>
+      assert {:ok, entry} = FileTransfer.parse_file_entry(bin)
+      assert entry.handle == 1
+      assert entry.permissions == 0x200
+      assert entry.size == 100
+      assert entry.name =~ "Firmware"
+      assert entry.version =~ "1.0"
+    end
+
+    test "format_permissions" do
+      assert FileTransfer.format_permissions(0x01) == "R"
+      assert FileTransfer.format_permissions(0x05) == "RE"
     end
   end
 end

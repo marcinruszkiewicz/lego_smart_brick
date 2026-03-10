@@ -31,6 +31,7 @@ defmodule SmartBrick.Device do
 
   alias SmartBrick.Constants
   alias SmartBrick.Protocol
+  alias SmartBrick.FileTransfer
 
   # -- Public structs ------------------------------------------------------
 
@@ -58,7 +59,9 @@ defmodule SmartBrick.Device do
       volume: 0,
       charging_state: 0,
       connected: false,
-      pending: %{}
+      pending: %{},
+      file_transfer: nil,
+      file_transfer_timer: nil
     ]
   end
 
@@ -104,6 +107,24 @@ defmodule SmartBrick.Device do
   @spec read_register(GenServer.server(), atom()) :: {:ok, binary()} | {:error, term()}
   def read_register(pid, register) when is_atom(register) do
     GenServer.call(pid, {:read_register, register}, Constants.default_timeout_ms() + 2_000)
+  end
+
+  @doc "List on-device files (file list handle 0). Returns [{handle, name, size, permissions}, ...]."
+  @spec list_files(GenServer.server()) :: {:ok, [FileTransfer.FileEntry.t()]} | {:error, term()}
+  def list_files(pid) do
+    GenServer.call(pid, :list_files, 30_000)
+  end
+
+  @doc "Read file by handle (1=firmware, 2=fault log, 3=telemetry). Returns raw binary."
+  @spec read_file(GenServer.server(), 1..3) :: {:ok, binary()} | {:error, term()}
+  def read_file(pid, handle) when handle in 1..3 do
+    GenServer.call(pid, {:read_file, handle}, 60_000)
+  end
+
+  @doc "Erase file by handle (2=fault log or 3=telemetry). Wire format TBD."
+  @spec erase_file(GenServer.server(), 2..3) :: :ok | {:error, term()}
+  def erase_file(pid, handle) when handle in 2..3 do
+    GenServer.call(pid, {:erase_file, handle}, 15_000)
   end
 
   @doc "Disconnect from the device."
@@ -216,6 +237,47 @@ defmodule SmartBrick.Device do
     {:noreply, %{state | pending: pending}}
   end
 
+  def handle_call(:list_files, from, state) do
+    if state.file_transfer do
+      {:reply, {:error, :transfer_in_progress}, state}
+    else
+      req = FileTransfer.build_request(FileTransfer.handle_file_list())
+      write_to_ftc(state.peripheral_ref, req)
+      timer_ref = Process.send_after(self(), {:file_transfer_timeout, :list}, 25_000)
+      ft = %{
+        from: from,
+        handle: 0,
+        mode: :list,
+        fragments: [],
+        waiting: :ack
+      }
+      {:noreply, %{state | file_transfer: ft, file_transfer_timer: timer_ref}}
+    end
+  end
+
+  def handle_call({:read_file, handle}, from, state) do
+    if state.file_transfer do
+      {:reply, {:error, :transfer_in_progress}, state}
+    else
+      req = FileTransfer.build_request(handle)
+      write_to_ftc(state.peripheral_ref, req)
+      timer_ref = Process.send_after(self(), {:file_transfer_timeout, {:read, handle}}, 55_000)
+      ft = %{
+        from: from,
+        handle: handle,
+        mode: :read,
+        fragments: [],
+        waiting: :ack
+      }
+      {:noreply, %{state | file_transfer: ft, file_transfer_timer: timer_ref}}
+    end
+  end
+
+  def handle_call({:erase_file, _handle}, _from, state) do
+    # Erase wire format (e.g. command byte 28) not documented in FILE_TRANSFER.md
+    {:reply, {:error, :not_implemented}, state}
+  end
+
   @impl true
   def handle_cast(:disconnect, state) do
     cancel_poll(state.poll_timer)
@@ -229,14 +291,14 @@ defmodule SmartBrick.Device do
     {:noreply, state}
   end
 
-  def handle_info({:btleplug_characteristic_value_changed, _char_uuid, raw}, state)
+  def handle_info({:btleplug_characteristic_value_changed, char_uuid, raw}, state)
       when is_binary(raw) do
-    handle_characteristic_data(raw, state)
+    route_characteristic_data(char_uuid, raw, state)
   end
 
-  def handle_info({:btleplug_characteristic_value_changed, _char_uuid, raw_list}, state)
+  def handle_info({:btleplug_characteristic_value_changed, char_uuid, raw_list}, state)
       when is_list(raw_list) do
-    handle_characteristic_data(:erlang.list_to_binary(raw_list), state)
+    route_characteristic_data(char_uuid, :erlang.list_to_binary(raw_list), state)
   end
 
   def handle_info({:btleplug_peripheral_disconnected, _uuid}, state) do
@@ -244,6 +306,16 @@ defmodule SmartBrick.Device do
     send(state.caller, {:smart_brick_disconnect})
     cancel_poll(state.poll_timer)
     {:stop, :normal, %{state | connected: false, poll_timer: nil}}
+  end
+
+  def handle_info({:file_transfer_timeout, _ref}, state) do
+    case state.file_transfer do
+      nil -> {:noreply, state}
+      %{from: from} ->
+        GenServer.reply(from, {:error, :timeout})
+        cancel_file_transfer_timer(state.file_transfer_timer)
+        {:noreply, %{state | file_transfer: nil, file_transfer_timer: nil}}
+    end
   end
 
   def handle_info({:request_timeout, key}, state) do
@@ -444,6 +516,111 @@ defmodule SmartBrick.Device do
   defp cancel_poll(_), do: :ok
 
   # -- Incoming data -------------------------------------------------------
+
+  defp route_characteristic_data(char_uuid, raw, state) do
+    # BLE stacks (e.g. CoreBluetooth) may return UUIDs in different case; normalize for comparison
+    u = String.downcase(char_uuid)
+
+    cond do
+      u == String.downcase(Constants.control_point_uuid()) or u == String.downcase(Constants.bidirectional_uuid()) ->
+        handle_characteristic_data(raw, state)
+
+      u == String.downcase(Constants.data_channel_1_uuid()) ->
+        handle_ftc_notification(raw, state)
+
+      u == String.downcase(Constants.data_channel_2_uuid()) ->
+        handle_ftd_notification(raw, state)
+
+      true ->
+        Logger.debug("[SmartBrick.Device] notification from unknown characteristic: #{char_uuid}")
+        {:noreply, state}
+    end
+  end
+
+  defp handle_ftc_notification(raw, state) do
+    case state.file_transfer do
+      nil ->
+        Logger.debug("[SmartBrick.Device] FTC notification (no pending transfer): #{Base.encode16(raw)}")
+        {:noreply, state}
+
+      ft ->
+        case FileTransfer.parse_ftc(raw) do
+          {:ack, _handle} ->
+            {:noreply, %{state | file_transfer: %{ft | waiting: :data}}}
+
+          {:end, handle} ->
+            confirm = FileTransfer.build_confirm(handle)
+            write_to_ftc(state.peripheral_ref, confirm)
+            {:noreply, %{state | file_transfer: %{ft | waiting: :confirm_ack}}}
+
+          {:confirm_ack, _handle} ->
+            cancel_file_transfer_timer(state.file_transfer_timer)
+            result = build_file_transfer_result(ft)
+            GenServer.reply(ft.from, result)
+            {:noreply, %{state | file_transfer: nil, file_transfer_timer: nil}}
+
+          :unknown ->
+            {:noreply, state}
+        end
+    end
+  end
+
+  defp handle_ftd_notification(raw, state) do
+    case state.file_transfer do
+      nil ->
+        Logger.debug("[SmartBrick.Device] FTD notification (no pending transfer): #{byte_size(raw)} bytes")
+        {:noreply, state}
+
+      %{waiting: :data} = ft ->
+        mode = ft.mode
+        parsed =
+          if mode == :list do
+            FileTransfer.parse_ftd(raw, :file_list)
+          else
+            FileTransfer.parse_ftd(raw, :file_content)
+          end
+
+        case parsed do
+          {:file_list, entries} ->
+            new_ft = %{ft | fragments: [entries | ft.fragments]}
+            {:noreply, %{state | file_transfer: new_ft}}
+
+          {:fragment, _index, data} ->
+            new_ft = %{ft | fragments: [data | ft.fragments]}
+            {:noreply, %{state | file_transfer: new_ft}}
+        end
+    end
+  end
+
+  defp build_file_transfer_result(ft) do
+    case ft.mode do
+      :list ->
+        # We stored one element per FTD; for file list it's [entries]
+        entries = List.flatten(ft.fragments)
+        {:ok, entries}
+
+      :read ->
+        # Fragments in reverse order (first received last in list)
+        binary = ft.fragments |> Enum.reverse() |> Enum.join()
+        {:ok, binary}
+    end
+  end
+
+  defp write_to_ftc(peripheral_ref, data) do
+    SmartBrick.Ble.write_characteristic(
+      peripheral_ref,
+      Constants.data_channel_1_uuid(),
+      data,
+      with_response: true
+    )
+  end
+
+  defp cancel_file_transfer_timer(nil), do: :ok
+  defp cancel_file_transfer_timer(tref) when is_reference(tref) do
+    Process.cancel_timer(tref)
+    :ok
+  end
+  defp cancel_file_transfer_timer(_), do: :ok
 
   defp handle_characteristic_data(raw, state) do
     case Protocol.decode_response(raw) do

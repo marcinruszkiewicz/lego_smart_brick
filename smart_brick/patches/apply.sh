@@ -89,7 +89,7 @@ pub fn write_characteristic(
         let characteristics = peripheral.characteristics();
         let characteristic = characteristics
             .iter()
-            .find(|c| c.uuid.to_string() == characteristic_uuid)
+            .find(|c| c.uuid.to_string().to_lowercase() == characteristic_uuid.to_lowercase())
             .cloned();
 
         match characteristic {
@@ -150,7 +150,7 @@ pub fn read_characteristic(
         let characteristics = peripheral.characteristics();
         let characteristic = characteristics
             .iter()
-            .find(|c| c.uuid.to_string() == characteristic_uuid)
+            .find(|c| c.uuid.to_string().to_lowercase() == characteristic_uuid.to_lowercase())
             .cloned();
 
         match characteristic {
@@ -191,6 +191,13 @@ RUST_EOF
   echo "  Done."
 else
   echo "$PERIPHERAL_RS already patched."
+fi
+
+# If peripheral was already patched, upgrade UUID comparison to case-insensitive (for FTC/FTD on macOS)
+if grep -q 'c.uuid.to_string() == characteristic_uuid' "$PERIPHERAL_RS" 2>/dev/null; then
+  echo "Updating $PERIPHERAL_RS for case-insensitive UUID match..."
+  sed -i '' 's/c\.uuid\.to_string() == characteristic_uuid/c.uuid.to_string().to_lowercase() == characteristic_uuid.to_lowercase()/g' "$PERIPHERAL_RS"
+  echo "  Done."
 fi
 
 # --- Patch 4: Add Elixir declarations for write/read ---

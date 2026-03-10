@@ -7,6 +7,7 @@ defmodule SmartBrick.CLI do
   """
 
   alias SmartBrick.Device
+  alias SmartBrick.FileTransfer
 
   @scan_wait_ms 10_000
   @connect_timeout_ms 30_000
@@ -153,6 +154,9 @@ defmodule SmartBrick.CLI do
       "v" -> cmd_set_volume(device)
       "n" -> cmd_set_name(device)
       "r" -> cmd_read_register(device)
+      "f" -> cmd_list_files(device)
+      "t" -> cmd_download_telemetry(device)
+      "l" -> cmd_download_fault_log(device)
       "i" -> cmd_refresh_info(device)
       "d" ->
         Device.disconnect(device)
@@ -205,7 +209,7 @@ defmodule SmartBrick.CLI do
       Battery:  #{battery}%
       Volume:   #{volume}
 
-    Commands:  v=volume  n=name  r=register  i=info  d=disconnect  q=quit  ?=help
+    Commands:  v=volume  n=name  r=register  f=files  t=telemetry  l=fault log  i=info  d=disconnect  q=quit  ?=help
     """)
   end
 
@@ -214,6 +218,9 @@ defmodule SmartBrick.CLI do
       [v] Set volume (high / medium / low)
       [n] Set device name (max 12 chars)
       [r] Read a raw register by name
+      [f] List on-device files (file list)
+      [t] Download telemetry (handle 3), hex dump
+      [l] Download fault log (handle 2), hex dump
       [i] Refresh device info dashboard
       [d] Disconnect and return to scan
       [q] Quit
@@ -294,6 +301,61 @@ defmodule SmartBrick.CLI do
   defp cmd_refresh_info(device) do
     info = Device.info(device)
     print_dashboard(device, info)
+  end
+
+  defp cmd_list_files(device) do
+    IO.puts("  Requesting file list...")
+    case Device.list_files(device) do
+      {:ok, entries} ->
+        IO.puts("  Handle  Perms  Size   Name        Version")
+        IO.puts("  ------  -----  -----  ----------  ------")
+        for e <- entries do
+          perms = FileTransfer.format_permissions(e.permissions)
+          IO.puts("  #{e.handle}       #{String.pad_leading(perms, 5)}  #{String.pad_leading(Integer.to_string(e.size), 5)}  #{String.slice(e.name, 0, 10)}  #{String.slice(e.version, 0, 6)}")
+        end
+
+      {:error, reason} ->
+        IO.puts("  Failed: #{inspect(reason)}")
+    end
+  end
+
+  defp cmd_download_telemetry(device) do
+    IO.puts("  Downloading telemetry (handle 3)...")
+    case Device.read_file(device, 3) do
+      {:ok, data} ->
+        IO.puts("  #{byte_size(data)} bytes:")
+        hex_dump(data)
+
+      {:error, reason} ->
+        IO.puts("  Failed: #{inspect(reason)}")
+    end
+  end
+
+  defp cmd_download_fault_log(device) do
+    IO.puts("  Downloading fault log (handle 2)...")
+    case Device.read_file(device, 2) do
+      {:ok, data} ->
+        IO.puts("  #{byte_size(data)} bytes:")
+        hex_dump(data)
+
+      {:error, reason} ->
+        IO.puts("  Failed: #{inspect(reason)}")
+    end
+  end
+
+  defp hex_dump(binary) do
+    line_size = 16
+    num_lines = div(byte_size(binary) + line_size - 1, line_size)
+
+    for i <- 0..(num_lines - 1) do
+      offset = i * line_size
+      len = min(line_size, byte_size(binary) - offset)
+      chunk = binary_part(binary, offset, len)
+      hex = chunk |> Base.encode16(case: :lower) |> String.graphemes() |> Enum.chunk_every(2) |> Enum.map(&Enum.join/1) |> Enum.join(" ")
+      ascii = for <<b <- chunk>>, do: if(b in 0x20..0x7E, do: <<b>>, else: ".")
+      ascii_str = ascii |> Enum.join()
+      IO.puts("    #{String.pad_leading(Integer.to_string(offset, 16), 4)}  #{String.pad_trailing(hex, 48)}  |#{ascii_str}|")
+    end
   end
 
   # -- Helpers -------------------------------------------------------------

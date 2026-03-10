@@ -8,8 +8,9 @@ Read, analyze, and clone **ISO 15693 (NFC Type 5)** tags from the LEGO smart bri
 |------|-------------|
 | **nfc_tool/** | Arduino sketch (ESP32 + PN7150). Reads and writes ISO 15693 tags over serial. Supports a `CLONE:` command protocol driven from the Mac. |
 | **mac_capture/** | Elixir app. Three modes: **capture** (read tags and save), **analyze** (diff/compare dumps), and **clone** (write a saved tag to a blank sticker). |
+| **smart_brick/** | Elixir app that provides a CLI to connect to a smart brick with BLE and interact with it. |
 | **firmware/** | Python scripts for firmware analysis: extraction, disassembly, crypto tracing, key candidate extraction, and Bilbo API probing. |
-| **data/** | Saved tag dumps (`.jsonl`), candidate AES keys, and reference data from [node-smartplay](https://github.com/nathankellenicki/node-smartplay). |
+| **data/** | Saved tag dumps (`.jsonl`), candidate AES keys, and reference tag data from [node-smartplay](https://github.com/nathankellenicki/node-smartplay). |
 | **docs/** | Technical findings: tag format, NFC chip ID, encryption analysis, cloning guide. |
 
 ## Hardware
