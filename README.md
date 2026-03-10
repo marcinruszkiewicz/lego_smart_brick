@@ -74,7 +74,7 @@ See [docs/encryption-analysis.md](docs/encryption-analysis.md) and [firmware/DIS
 
 ### Cloning feasibility
 
-Since all tags of the same type share identical encrypted payloads (regardless of UID), and the data is openly readable, **byte-perfect cloning to a blank writable tag should produce a functionally identical tag**. The smart brick reads tag data, not UID.
+Since all tags of the same type share identical encrypted payloads (regardless of UID), and the data is openly readable, **byte-perfect cloning to a blank writable tag produces a functionally identical tag**. The smart brick reads tag data, not UID. Cloning works even when the blank has a different UID or chip vendor (e.g. LEGO tags use EM4233, UID prefix `E016`; blanks with prefix `E004` or other ISO 15693 chips behave the same once the payload is written). Smaller blanks (e.g. 112 bytes = 28 blocks) work for tags that fit — R2-D2, Tie Fighter, and X-Wing; larger identities need more capacity (see [docs/cloning-guide.md](docs/cloning-guide.md)).
 
 ## Docs
 

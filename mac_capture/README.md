@@ -42,7 +42,7 @@ Press **Ctrl+C** to stop.
 
 ### Clone (write a saved tag to a blank tag)
 
-Clone mode loads saved dumps from `../data/*.jsonl`, shows a menu, then sends a `CLONE:<hex>` command to the Arduino and writes the blocks to a presented blank tag.
+Clone mode loads saved dumps from `../data/*.jsonl`, shows a menu, then sends a `CLONE:<hex>` command to the Arduino and writes the blocks to a presented blank tag. Clones behave identically to the original even when the blank has a different UID or chip vendor (e.g. `E004`); the smart brick uses tag data, not UID. On 112-byte (28-block) stickers, only tags that fit in 28 blocks (e.g. R2-D2, Tie Fighter, X-Wing) can be cloned — see [../docs/cloning-guide.md](../docs/cloning-guide.md).
 
 Run:
 

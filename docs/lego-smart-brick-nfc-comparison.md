@@ -32,6 +32,8 @@ The tag chip is **NOT NXP** — it's made by **EM Microelectronic**. The EM4233 
 - The remaining 4 bytes are unique per tag: **1FC66027** vs **277878E9**.
 - Yoda minifigure has  **1BC9BA8D** in UID
 
+**Clones on other chips:** The brick does not key off the UID. Cloning the same payload to blanks with different UIDs (e.g. `E0040150B81E7E2E`, `E0040150B81E7EA6`) produces identical behaviour; the brick uses the stored block data only. Blanks from other vendors (UID prefix e.g. `E004`) work as long as they are ISO 15693 writable.
+
 ## Block 0 (header)
 
 
@@ -97,9 +99,9 @@ Full analysis: [encryption-analysis.md](encryption-analysis.md).
 
 Since tag data is openly readable, identical across same-type tags, and not UID-bound:
 
-- **Byte-perfect cloning** to a blank writable EM4233/ISO 15693 tag should produce a tag the smart brick treats identically to the original.
+- **Byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically to the original. The blank need not be the same chip as LEGO (EM4233, `E016`); blanks with different UIDs or vendors (e.g. `E004`) work.
 - The clone tool writes only the data blocks (stripping trailing zero filler and `0001` end markers).
-- Factory tags are permanently write-locked, so you need blank writable stickers.
+- Factory tags are permanently write-locked, so you need blank writable stickers. Smaller stickers (e.g. 112 bytes = 28 blocks) work for tags that fit (R2-D2, Tie Fighter, X-Wing). If a tag is too large for the sticker (partial write), the brick ignores the tag entirely — no error, no crash.
 
 See [cloning-guide.md](cloning-guide.md) for the practical workflow.
 

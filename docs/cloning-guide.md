@@ -10,13 +10,21 @@ LEGO smart tags use EM4233 chips (ISO 15693 / NFC Type 5). Key properties that m
 
 The original factory tags are permanently write-locked, but blank writable tags accept the same data and should function identically.
 
+### UID and chip vendor independence
+
+The smart brick identifies tags by the **stored block data** (encrypted payload), not by the UID. Cloning the same tag dump onto multiple blank stickers with different UIDs produces identical behaviour on the brick. Verified with Tie Fighter clones on blanks with UIDs `E0040150B81E7E2E` and `E0040150B81E7EA6` — both behave the same as the original LEGO tag (UID prefix `E016`, EM4233). Blanks from other chip vendors (e.g. UID prefix `E004`) work as long as they are ISO 15693 writable; the brick does not require the same IC as the originals.
+
 ## Compatible blank tags
 
 You need **ISO 15693 / NFC Type 5** writable tag stickers. Specifically:
 
 - **EM4233** (ideal — same chip as the originals)
 - **ICODE SLIX / SLIX2** (NXP, also ISO 15693 compatible)
-- Any ISO 15693 tag with at least 66 blocks × 4 bytes (264 bytes) of writable EEPROM
+- Any ISO 15693 tag with enough writable EEPROM for the tag you want to clone (see below)
+
+**Smaller stickers (e.g. 112 bytes = 28 blocks):** Tags that use ≤ 28 blocks total (block 0 header + payload) fit on 112-byte stickers. In the current dump set that is **R2-D2** (20 blocks), **Tie Fighter** (28 blocks), and **X-Wing** (28 blocks). Larger tags (Vader, Lightsaber, etc.) need more blocks and will not fit. Clone only tags that fit within your sticker’s block count.
+
+**Full-size (264+ bytes):** For all saved tags you need at least 66 blocks × 4 bytes (264 bytes) of writable EEPROM.
 
 Look for "ISO 15693 NFC sticker" or "ICODE SLIX sticker" or "NFC Type 5 sticker" when purchasing. Standard NFC stickers (NTAG213/215/216) will **not** work — those are ISO 14443 (Type 2), a completely different protocol.
 
@@ -112,8 +120,9 @@ Responses from Arduino to Mac:
 - Hold the tag steady on the reader for 1-2 seconds.
 
 **Partial write (some blocks OK, some fail):**
-- The tag may have insufficient memory. Ensure it has at least as many blocks as the source tag.
-- Some blocks on partially-written tags may be one-time-programmable. Use a fresh tag.
+- The tag may have insufficient memory. Ensure it has at least as many blocks as the source tag (e.g. on a 112-byte sticker only R2-D2, Tie Fighter, and X-Wing fit).
+- If you clone a tag that doesn’t fit (e.g. Lightsaber to a 28-block sticker), the brick **does nothing** — it ignores the tag entirely (no error, no crash). Use a sticker with enough blocks or pick a smaller tag.
+- Some blocks on partially-written tags may be one-time-programmable. Use a fresh tag for the next clone.
 
 ## Adding new tags
 
