@@ -58,6 +58,9 @@ static uint8_t s_respSize;
 static bool     s_cloneMode = false;
 static uint8_t  s_cloneData[512]; /* max 128 blocks × 4 bytes */
 static uint16_t s_cloneLen = 0;   /* bytes in s_cloneData */
+#if DEBUG_NFC
+static char     s_dbg[32];
+#endif
 
 static uint8_t hexCharToNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
@@ -249,7 +252,14 @@ void writeTagFromCloneData() {
   Serial.print(F("WRITE_START:"));
   Serial.println(numBlocks);
 
+#if DEBUG_NFC
+  Serial.println(F("[D] W start"));
+#endif
   for (uint16_t blockNum = 0; blockNum < numBlocks; blockNum++) {
+#if DEBUG_NFC
+    snprintf(s_dbg, sizeof(s_dbg), "[D] W blk %u", (unsigned)blockNum);
+    Serial.println(s_dbg);
+#endif
     uint8_t writeCmd[7];
     writeCmd[0] = 0x02;  /* flags: high data rate, unaddressed */
     writeCmd[1] = 0x21;  /* WRITE SINGLE BLOCK */
@@ -261,12 +271,20 @@ void writeTagFromCloneData() {
 
     s_respSize = sizeof(s_respBuf);
     delay(20);
+#if DEBUG_NFC
+    snprintf(s_dbg, sizeof(s_dbg), "[D] W send %u", (unsigned)blockNum);
+    Serial.println(s_dbg);
+#endif
     nfc.readerTagCmd(writeCmd, sizeof(writeCmd), s_respBuf, &s_respSize);
 
     /* Read back to verify */
     delay(15);
     uint8_t readCmd[] = { 0x02, 0x20, (uint8_t)blockNum };
     s_respSize = sizeof(s_respBuf);
+#if DEBUG_NFC
+    snprintf(s_dbg, sizeof(s_dbg), "[D] W verify %u", (unsigned)blockNum);
+    Serial.println(s_dbg);
+#endif
     nfc.readerTagCmd(readCmd, sizeof(readCmd), s_respBuf, &s_respSize);
 
     bool verified = false;
@@ -416,6 +434,10 @@ void checkSerialCommands() {
           char* hex = s_serialBuf + 6;
           uint16_t hexLen = s_serialPos - 6;
           uint16_t byteLen = parseHexString(hex, hexLen);
+#if DEBUG_NFC
+          snprintf(s_dbg, sizeof(s_dbg), "[D] CLONE h=%u b=%u", (unsigned)hexLen, (unsigned)byteLen);
+          Serial.println(s_dbg);
+#endif
           if (byteLen > 0 && byteLen % 4 == 0) {
             s_cloneLen = byteLen;
             s_cloneMode = true;
@@ -426,9 +448,15 @@ void checkSerialCommands() {
             Serial.println(F("CLONE_ERR:Invalid hex data (must be multiple of 8 hex chars)"));
           }
         } else if (strncmp(s_serialBuf, "READ", 4) == 0) {
+#if DEBUG_NFC
+          Serial.println(F("[D] READ"));
+#endif
           s_cloneMode = false;
           Serial.println(F("MODE:read"));
         } else if (strncmp(s_serialBuf, "CANCEL", 6) == 0) {
+#if DEBUG_NFC
+          Serial.println(F("[D] CANCEL"));
+#endif
           s_cloneMode = false;
           s_cloneLen = 0;
           Serial.println(F("MODE:read (clone cancelled)"));
@@ -468,17 +496,137 @@ void setup() {
 void loop() {
   checkSerialCommands();
 
-  if (!nfc.isTagDetected(500)) {
+#if DEBUG_NFC
+  static uint32_t s_loopCount = 0;
+  s_loopCount++;
+  if (s_loopCount % 10 == 0 || s_cloneMode) {
+    snprintf(s_dbg, sizeof(s_dbg), "[D] L%lu c=%d", (unsigned long)s_loopCount, s_cloneMode ? 1 : 0);
+    Serial.println(s_dbg);
+  }
+#endif
+
+  if (s_cloneMode) {
+#if DEBUG_NFC
+    Serial.println(F("[D] C wait"));
+#endif
+    /* Clone mode: only wait for a tag to write to. No reading. Drain serial often. */
+    for (int i = 0; i < 20; i++) {
+      checkSerialCommands();
+      if (!s_cloneMode) {
+#if DEBUG_NFC
+        Serial.println(F("[D] C cancel"));
+#endif
+        return;  /* CANCEL or READ */
+      }
+      if (nfc.isTagDetected(50)) {
+#if DEBUG_NFC
+        snprintf(s_dbg, sizeof(s_dbg), "[D] C poll %d", i);
+        Serial.println(s_dbg);
+#endif
+        break;
+      }
+      if (i == 19) {
+#if DEBUG_NFC
+      Serial.println(F("[D] C no tag"));
+#endif
+        /* Keep discovery alive while waiting in clone mode. */
+        nfc.reset();
+        nfc.startDiscovery();
+        delay(100);
+        return;
+      }
+    }
+    if (!s_cloneMode) return;
+
+#if DEBUG_NFC
+    Serial.println(F("[D] C confirm"));
+#endif
+    /* Tag was just seen in poll; avoid isTagDetected(0) which may block. Use short re-check. */
+    if (!nfc.isTagDetected(10)) {
+#if DEBUG_NFC
+      Serial.println(F("[D] C tag lost"));
+#endif
+      nfc.reset();
+      nfc.startDiscovery();
+      delay(100);
+      return;
+    }
+
+#if DEBUG_NFC
+    Serial.println(F("[D] C Type5"));
+#endif
+    if (nfc.remoteDevice.getProtocol() != nfc.protocol.ISO15693 ||
+        nfc.remoteDevice.getModeTech() != nfc.tech.PASSIVE_15693) {
+#if DEBUG_NFC
+      snprintf(s_dbg, sizeof(s_dbg), "[D] C !T5 p=%d t=%d", (int)nfc.remoteDevice.getProtocol(), (int)nfc.remoteDevice.getModeTech());
+      Serial.println(s_dbg);
+#endif
+      Serial.println(F("Not Type 5 (ISO15693) - use a blank Type 5 tag."));
+      nfc.waitForTagRemoval();
+      nfc.reset();
+      nfc.startDiscovery();
+      delay(500);
+      return;
+    }
+
+#if DEBUG_NFC
+    Serial.println(F("[D] C write"));
+#endif
+    Serial.println(F("[CLONE] Writing to tag..."));
+    writeTagFromCloneData();
+#if DEBUG_NFC
+    Serial.println(F("[D] C waitrm"));
+#endif
+    s_cloneMode = false;
+    s_cloneLen = 0;
+    Serial.println(F("MODE:read (clone complete, back to read mode)"));
+    Serial.println(F("Remove the card."));
+    nfc.waitForTagRemoval();
+#if DEBUG_NFC
+    Serial.println(F("[D] C done"));
+#endif
     nfc.reset();
+    nfc.startDiscovery();
+    Serial.println(F("Waiting for ISO15693 tag..."));
     delay(500);
     return;
   }
 
+  /* Read mode: wait for tag (drain serial often when idle so we can receive CLONE). */
+  if (!nfc.isTagDetected(500)) {
 #if DEBUG_NFC
-  Serial.print(F("[DEBUG] Tag detected, protocol="));
-  Serial.print((int)nfc.remoteDevice.getProtocol());
-  Serial.print(F(" tech="));
-  Serial.println((int)nfc.remoteDevice.getModeTech());
+    Serial.println(F("[D] R drain"));
+#endif
+    for (int i = 0; i < 20; i++) {
+      checkSerialCommands();
+      if (s_cloneMode) {
+#if DEBUG_NFC
+        Serial.println(F("[D] R+CLONE"));
+#endif
+        return;
+      }
+      if (nfc.isTagDetected(50)) {
+#if DEBUG_NFC
+        snprintf(s_dbg, sizeof(s_dbg), "[D] R poll %d", i);
+        Serial.println(s_dbg);
+#endif
+        break;
+      }
+      if (i == 19) {
+#if DEBUG_NFC
+        Serial.println(F("[D] R reset"));
+#endif
+        nfc.reset();
+        nfc.startDiscovery();
+        delay(500);
+        return;
+      }
+    }
+  }
+
+#if DEBUG_NFC
+  snprintf(s_dbg, sizeof(s_dbg), "[D] tag p=%d t=%d", (int)nfc.remoteDevice.getProtocol(), (int)nfc.remoteDevice.getModeTech());
+  Serial.println(s_dbg);
 #endif
 
   if (nfc.remoteDevice.getProtocol() != nfc.protocol.ISO15693 ||
@@ -486,22 +634,15 @@ void loop() {
     Serial.println(F("Not Type 5 (ISO15693) - ignoring."));
     nfc.waitForTagRemoval();
     nfc.reset();
+    nfc.startDiscovery();
     delay(500);
     return;
   }
 
-  if (s_cloneMode) {
-    Serial.println(F("[CLONE] Writing to tag..."));
-    writeTagFromCloneData();
-    s_cloneMode = false;
-    s_cloneLen = 0;
-    Serial.println(F("MODE:read (clone complete, back to read mode)"));
-  } else {
 #if DEBUG_NFC
-    Serial.println(F("[DEBUG] Type 5 - reading blocks..."));
+  Serial.println(F("[D] T5 read"));
 #endif
-    emitTagJson();
-  }
+  emitTagJson();
 
   if (nfc.remoteDevice.hasMoreTags()) {
     nfc.activateNextTagDiscovery();
@@ -511,6 +652,7 @@ void loop() {
   }
 
   nfc.reset();
+  nfc.startDiscovery();
   Serial.println(F("Waiting for ISO15693 tag..."));
   delay(500);
 }

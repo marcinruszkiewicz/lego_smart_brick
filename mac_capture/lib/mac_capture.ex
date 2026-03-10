@@ -40,6 +40,7 @@ defmodule MacCapture do
       tries to find a port with "usbmodem" in the name, or prompts.
     - :baud - baud rate (default 115200)
     - :output_dir - directory for dump files (default: ../data relative to cwd)
+    - :debug - when true, also print Arduino debug lines starting with "[D]" or "[DEBUG]"
   """
   def run(opts \\ []) do
     port = (opts[:port] || find_usbmodem_port()) |> normalize_port()
@@ -62,10 +63,12 @@ defmodule MacCapture do
       IO.puts("Scanning: #{if item == "", do: "(no label)", else: item}")
       IO.puts("Press Ctrl+C to stop.\n")
 
+      debug = opts[:debug] == true
+
       case Circuits.UART.start_link() do
         {:ok, pid} ->
           try do
-            open_and_capture(pid, port, baud, output_path, item)
+            open_and_capture(pid, port, baud, output_path, item, debug)
           after
             Circuits.UART.close(pid)
             Circuits.UART.stop(pid)
@@ -101,12 +104,12 @@ defmodule MacCapture do
     end
   end
 
-  defp open_and_capture(pid, port, baud, output_path, item) do
+  defp open_and_capture(pid, port, baud, output_path, item, debug) do
     opts = [speed: baud, active: false]
 
     case Circuits.UART.open(pid, port, opts) do
       :ok ->
-        stream_capture(pid, output_path, "", item)
+        stream_capture(pid, output_path, "", item, debug)
       {:error, :einval} ->
         IO.puts("Failed to open #{port}: invalid argument (:einval).")
         IO.puts("  → Close the Arduino IDE Serial Monitor (or any other app using this port) and try again.")
@@ -117,21 +120,23 @@ defmodule MacCapture do
     end
   end
 
-  defp stream_capture(pid, output_path, buffer, item) do
+  defp stream_capture(pid, output_path, buffer, item, debug) do
     case Circuits.UART.read(pid, @read_timeout_ms) do
       {:ok, <<>>} ->
-        stream_capture(pid, output_path, buffer, item)
+        stream_capture(pid, output_path, buffer, item, debug)
 
       {:ok, data} ->
         new_buffer = buffer <> data
         {lines, rest} = split_lines(new_buffer)
-        next_item = Enum.reduce(lines, item, fn line, current_item ->
-          process_line(line, output_path, current_item)
-        end)
-        stream_capture(pid, output_path, rest, next_item)
+        next_item =
+          Enum.reduce(lines, item, fn line, current_item ->
+            process_line(line, output_path, current_item, debug)
+          end)
+
+        stream_capture(pid, output_path, rest, next_item, debug)
 
       {:error, _reason} ->
-        stream_capture(pid, output_path, buffer, item)
+        stream_capture(pid, output_path, buffer, item, debug)
     end
   end
 
@@ -151,10 +156,13 @@ defmodule MacCapture do
     end
   end
 
-  defp process_line(line, output_path, item) do
+  defp process_line(line, output_path, item, debug) do
     line = String.trim(line)
     cond do
       line == "" ->
+        item
+      String.starts_with?(line, "[D]") or String.starts_with?(line, "[DEBUG]") ->
+        if debug, do: IO.puts("  < #{line}")
         item
       String.starts_with?(line, @sysinfo_prefix) ->
         json_str = String.trim_leading(line, @sysinfo_prefix)

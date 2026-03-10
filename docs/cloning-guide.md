@@ -101,6 +101,9 @@ Responses from Arduino to Mac:
 - The tag may be write-locked (factory LEGO tags are permanently locked). Use a blank, unlocked tag.
 - Some tags require the OPTION flag (0x40) in the write command. If you see consistent failures on a known-writable tag, this may need adjustment in the Arduino sketch.
 
+**Timed out waiting for CLONE_READY:**
+- Remove any tag from the reader before choosing a tag to clone. The Arduino only processes the `CLONE:` command when it reaches the start of its loop; if it’s busy reading a tag or waiting for tag removal, the command is delayed and the Mac may time out. After sending the command, the tool will prompt you to present a blank tag.
+
 **Port busy error:**
 - Close Arduino Serial Monitor before running the clone tool. Only one application can use the serial port at a time.
 

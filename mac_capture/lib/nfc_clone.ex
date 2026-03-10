@@ -4,6 +4,7 @@ defmodule NfcClone do
 
   Run with: mix run -e "NfcClone.run()"
   Or: mix run -e "NfcClone.run(port: \"/dev/cu.usbmodem14101\")"
+  Or: mix run -e "NfcClone.run(debug: true)"  — show Arduino [DEBUG] lines (serial is exclusive, so use this instead of Serial Monitor)
   """
 
   @default_baud 115200
@@ -139,7 +140,7 @@ defmodule NfcClone do
       case Circuits.UART.start_link() do
         {:ok, pid} ->
           try do
-            do_clone(pid, port, baud, hex, length(blocks))
+            do_clone(pid, port, baud, hex, length(blocks), opts)
           after
             Circuits.UART.close(pid)
             Circuits.UART.stop(pid)
@@ -160,19 +161,24 @@ defmodule NfcClone do
     |> Enum.reverse()
   end
 
-  defp do_clone(pid, port, baud, hex, total_blocks) do
+  defp do_clone(pid, port, baud, hex, total_blocks, opts) do
+    debug = opts[:debug] == true
+
     case Circuits.UART.open(pid, port, speed: baud, active: false) do
       :ok ->
         drain_startup(pid)
 
+        if debug, do: IO.puts("(Debug: showing Arduino [DEBUG] lines)")
+
         IO.puts("Sending CLONE command (#{total_blocks} blocks)...")
+        IO.puts("(If Arduino is busy reading a tag, remove it so CLONE can be accepted.)")
         Circuits.UART.write(pid, "CLONE:#{hex}\n")
 
         IO.puts("Waiting for Arduino to acknowledge...")
-        wait_for_ack(pid, 0)
+        wait_for_ack(pid, 0, debug)
 
         IO.puts("Present a blank tag to the reader.\n")
-        wait_for_write_results(pid, total_blocks, 0, 0)
+        wait_for_write_results(pid, total_blocks, 0, 0, debug)
 
       {:error, :einval} ->
         IO.puts("Failed to open #{port}: port busy.")
@@ -192,32 +198,57 @@ defmodule NfcClone do
     end
   end
 
-  defp wait_for_ack(_pid, attempts) when attempts > 60 do
+  defp wait_for_ack(pid, attempts, debug), do: wait_for_ack(pid, attempts, "", debug)
+
+  defp wait_for_ack(_pid, attempts, _buffer, _debug) when attempts > 60 do
     IO.puts("Timed out waiting for CLONE_READY from Arduino.")
     :timeout
   end
 
-  defp wait_for_ack(pid, attempts) do
+  defp wait_for_ack(pid, attempts, buffer, debug) do
     case Circuits.UART.read(pid, @read_timeout_ms) do
       {:ok, <<>>} ->
-        wait_for_ack(pid, attempts + 1)
+        wait_for_ack(pid, attempts + 1, buffer, debug)
 
       {:ok, data} ->
-        lines = String.split(data, ~r/\r\n|\r|\n/, trim: true)
+        buffer = buffer <> data
+
+        # Split so we keep trailing incomplete line in buffer for next read
+        parts = String.split(buffer, ~r/\r\n|\r|\n/, trim: false)
+        {complete_lines, rest} =
+          if String.ends_with?(buffer, "\n") or String.ends_with?(buffer, "\r") do
+            {Enum.reject(parts, &(&1 == "")), ""}
+          else
+            complete = Enum.drop(parts, -1)
+            rest = List.last(parts) || ""
+            {complete, rest}
+          end
 
         ack =
-          Enum.find(lines, fn line ->
+          Enum.find(complete_lines, fn line ->
             String.starts_with?(line, @clone_ready_prefix) or
               String.starts_with?(line, @clone_err_prefix)
           end)
 
-        Enum.each(lines, fn line ->
+        # Also recognize ack when split across reads (e.g. "CLONE_READY:43 " in one chunk, "blocks..." in next)
+        ack =
+          cond do
+            ack -> ack
+            String.contains?(buffer, "CLONE_READY:") -> "CLONE_READY:ok"
+            String.contains?(buffer, "CLONE_ERR:") -> "CLONE_ERR:ok"
+            true -> nil
+          end
+
+        Enum.each(complete_lines, fn line ->
           line = String.trim(line)
-          if line != "" and !String.starts_with?(line, "[DEBUG]"), do: IO.puts("  < #{line}")
+          show = line != "" and (debug or (!String.starts_with?(line, "[DEBUG]") and !String.starts_with?(line, "[D]")))
+          if show, do: IO.puts("  < #{line}")
         end)
 
         case ack do
-          nil -> wait_for_ack(pid, attempts + 1)
+          nil ->
+            wait_for_ack(pid, attempts + 1, rest, debug)
+
           line when is_binary(line) ->
             if String.starts_with?(line, @clone_err_prefix) do
               IO.puts("\nArduino rejected the clone data.")
@@ -228,14 +259,14 @@ defmodule NfcClone do
         end
 
       {:error, _} ->
-        wait_for_ack(pid, attempts + 1)
+        wait_for_ack(pid, attempts + 1, buffer, debug)
     end
   end
 
-  defp wait_for_write_results(pid, total, ok_count, fail_count) do
+  defp wait_for_write_results(pid, total, ok_count, fail_count, debug) do
     case Circuits.UART.read(pid, @read_timeout_ms) do
       {:ok, <<>>} ->
-        wait_for_write_results(pid, total, ok_count, fail_count)
+        wait_for_write_results(pid, total, ok_count, fail_count, debug)
 
       {:ok, data} ->
         lines = String.split(data, ~r/\r\n|\r|\n/, trim: true)
@@ -243,6 +274,10 @@ defmodule NfcClone do
         {new_ok, new_fail, done?} =
           Enum.reduce(lines, {ok_count, fail_count, false}, fn line, {ok, fail, done} ->
             line = String.trim(line)
+
+            if debug and (String.starts_with?(line, "[DEBUG]") or String.starts_with?(line, "[D]")) do
+              IO.puts("  < #{line}")
+            end
 
             cond do
               String.starts_with?(line, @write_ok_prefix) ->
@@ -270,11 +305,11 @@ defmodule NfcClone do
           IO.puts("")
           finish_clone(new_ok, new_fail, total)
         else
-          wait_for_write_results(pid, total, new_ok, new_fail)
+          wait_for_write_results(pid, total, new_ok, new_fail, debug)
         end
 
       {:error, _} ->
-        wait_for_write_results(pid, total, ok_count, fail_count)
+        wait_for_write_results(pid, total, ok_count, fail_count, debug)
     end
   end
 
