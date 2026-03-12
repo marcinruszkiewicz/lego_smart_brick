@@ -18,8 +18,8 @@ defmodule NfcDecrypt do
   Run with:
     mix run -e "NfcDecrypt.run()"
     mix run -e "NfcDecrypt.run(\"data/hardware_md_tag_dumps.jsonl\")"
-    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 50_000)"
-    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 0)"
+    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 50_000)"  # CCM random-key brute (not ECB)
+    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 0)"       # skip random-key CCM
     mix run -e "NfcDecrypt.run_v2()"                              # V2 only (corrected offset)
     mix run -e "NfcDecrypt.run_aes_ccm()"                         # AES-CCM with firmware keys
   """
@@ -42,12 +42,25 @@ defmodule NfcDecrypt do
   end
 
   def run(jsonl_path \\ nil, opts \\ []) do
-    path = jsonl_path || default_dump_path()
-    raw = load_tags(path)
+    {paths, raw} =
+      if jsonl_path do
+        path = jsonl_path
+        {[path], load_tags(path)}
+      else
+        data_dir = resolve_data_dir()
+        paths = Path.wildcard(Path.join(data_dir, "*.jsonl")) |> Enum.sort()
+        raw = Enum.flat_map(paths, &load_tags/1)
+        {paths, raw}
+      end
+
     tags = drop_test_tags(raw)
     skipped = length(raw) - length(tags)
     if skipped > 0, do: IO.puts("Skipped #{skipped} test tag(s) ([FAIL] / [RED FLASH])\n")
-    IO.puts("Loaded #{length(tags)} tag(s) from #{path}\n")
+    if length(paths) == 1 do
+      IO.puts("Loaded #{length(tags)} tag(s) from #{hd(paths)}\n")
+    else
+      IO.puts("Loaded #{length(tags)} tag(s) from #{length(paths)} file(s): #{Enum.join(paths, ", ")}\n")
+    end
 
     # Dedupe by payload so we don't double-count identical tags (e.g. two Lukes)
     unique = dedupe_by_payload(tags)
@@ -85,11 +98,11 @@ defmodule NfcDecrypt do
     IO.puts("\n=== AES-128-ECB with candidate keys ===")
     Enum.each(unique, &try_aes_ecb/1)
 
-    # (2b) AES-ECB brute-force with random keys (configurable count)
+    # (2b) AES-CCM brute-force with random keys (payload is CCM, not ECB; same option name for compatibility)
     num_rand = opts[:aes_bruteforce_tries] || 100_000
     if num_rand > 0 and length(unique) >= 1 do
-      IO.puts("\n=== AES-128-ECB brute-force (#{num_rand} random 16-byte keys, validate on ≥4 tags) ===")
-      try_aes_ecb_bruteforce(List.first(unique), num_rand, unique)
+      IO.puts("\n=== AES-128-CCM brute-force (#{num_rand} random 16-byte keys, embedded-nonce then header-nonce) ===")
+      try_ccm_random_keys(unique, num_rand)
     end
     num_str = opts[:aes_bruteforce_strings] || 0
     if num_str > 0 and length(unique) >= 1 do
@@ -170,16 +183,6 @@ defmodule NfcDecrypt do
 
     IO.puts("\n=== Compression / alternative-encoding hypothesis ===")
     compression_analysis(unique)
-  end
-
-  defp default_dump_path do
-    # From mac_capture/, data is ../data; from project root, data is data/
-    cwd = File.cwd!()
-    if String.ends_with?(cwd, "mac_capture") do
-      Path.expand("../data/hardware_md_tag_dumps.jsonl", cwd)
-    else
-      Path.join(cwd, "data/hardware_md_tag_dumps.jsonl")
-    end
   end
 
   defp load_tags(path) do
@@ -518,65 +521,8 @@ defmodule NfcDecrypt do
     end
   end
 
-  # Brute-force AES-128-ECB first block with many random 16-byte keys.
-  # Only reports keys that decrypt to TLV-like (type_ok+len_ok) on ≥2 tags (cross-tag validation).
-  defp try_aes_ecb_bruteforce(tag, num_tries, all_tags) do
-    payload = payload_binary(tag)
-    item = Map.get(tag, "item", tag["uid"])
-    all_payloads = Enum.map(all_tags, &payload_binary/1)
-    min_validated = min(4, length(all_payloads))
-
-    if byte_size(payload) < 16 do
-      IO.puts("  #{item}: skip (payload < 16)")
-    else
-      block0 = binary_part(payload, 0, 16)
-      {raw_hits, validated_hits, top5} =
-        Enum.reduce(1..num_tries, {[], [], []}, fn _i, {raw_hits, validated_hits, top5} ->
-          key = :rand.bytes(16)
-          try do
-            dec = :crypto.crypto_one_time(:aes_128_ecb, key, block0, false)
-            dec_list = :binary.bin_to_list(dec)
-            {type_ok, len_ok, next_len} = score_tlv_next(dec_list ++ List.duplicate(0, 8), 300)
-            ratio = printable_or_zero_ratio(dec_list)
-            top5 = update_top5(top5, {key, dec_list, ratio}, 5)
-            if type_ok and len_ok do
-              {n, _} = validate_aes_key_on_payloads(key, all_payloads)
-              validated = if n >= min_validated, do: [{key, dec_list, next_len, n} | validated_hits], else: validated_hits
-              {[{key, dec_list, next_len} | raw_hits], validated, top5}
-            else
-              {raw_hits, validated_hits, top5}
-            end
-          rescue
-            _ -> {raw_hits, validated_hits, top5}
-          end
-        end)
-
-      n_raw = length(raw_hits)
-      n_val = length(validated_hits)
-      valid_note = if length(all_tags) < 4, do: " (only #{length(all_tags)} tag(s), require all)", else: " (≥#{min_validated} tags)"
-      IO.puts("  #{item}: tried #{num_tries} random 16-byte keys → #{n_raw} raw TLV-like hits, #{n_val} validated#{valid_note}")
-      if validated_hits != [] do
-        for {key, dec, nl, n} <- Enum.take(validated_hits, 5) do
-          hex = dec |> Enum.take(8) |> Enum.map(fn b -> Integer.to_string(b, 16) |> String.pad_leading(2, "0") end) |> Enum.join(" ")
-          IO.puts("    >>> key_hex=#{Base.encode16(key, case: :lower)} next_len=#{nl} validated_on=#{n}/#{length(all_tags)} first8=#{hex}")
-        end
-        if length(validated_hits) > 5, do: IO.puts("    ... and #{length(validated_hits) - 5} more")
-      else
-        if raw_hits != [] do
-          IO.puts("    (no key passed cross-tag validation; #{n_raw} false positives filtered out)")
-        else
-          best_ratio = if top5 == [], do: 0.0, else: elem(List.first(top5), 2)
-          IO.puts("    no TLV-like hits; top decryption printable ratio: #{Float.round(best_ratio, 4)}")
-          for {key, dec, ratio} <- Enum.take(top5, 3) do
-            hex = dec |> Enum.take(8) |> Enum.map(fn b -> Integer.to_string(b, 16) |> String.pad_leading(2, "0") end) |> Enum.join(" ")
-            IO.puts("       key_hex=#{Base.encode16(key, case: :lower)} ratio=#{Float.round(ratio, 4)} first8=#{hex}")
-          end
-        end
-      end
-    end
-  end
-
   # For a key, decrypt first 16 bytes of each payload; return {count where type_ok+len_ok, total_with_16_bytes}.
+  # (Used by try_aes_ecb_bruteforce_strings and by try_aes_ecb candidate-key validation.)
   defp validate_aes_key_on_payloads(key, all_payloads) do
     result =
       Enum.reduce(all_payloads, 0, fn pl, acc ->
@@ -2178,6 +2124,24 @@ defmodule NfcDecrypt do
         end
       _ -> []
     end)
+  end
+
+  # Generate n random 16-byte keys for CCM brute-force (payload is AES-CCM, not ECB).
+  defp generate_random_keys(n) when is_integer(n) and n > 0 do
+    for _ <- 1..n, do: :crypto.strong_rand_bytes(16)
+  end
+
+  # Try many random keys with CCM strategies (embedded nonce first, then header nonce).
+  defp try_ccm_random_keys(tags, num_keys) do
+    keys = generate_random_keys(num_keys)
+    IO.puts("  Trying #{num_keys} random keys with CCM embedded-nonce strategy...")
+    hit = try_ccm_embedded_nonce(tags, keys)
+    if hit do
+      hit
+    else
+      IO.puts("  No hit; trying same keys with CCM header-nonce strategy...")
+      try_ccm_header_nonce(tags, keys)
+    end
   end
 
   # Strategy 1: [nonce (N bytes) | ciphertext | MAC (M bytes)] all within enc

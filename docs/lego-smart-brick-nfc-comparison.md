@@ -74,7 +74,33 @@ All tags in `data/hardware_md_tag_dumps.jsonl` and `data/nfc_dump_2026-03-07.jso
 - **Bytes 0–1 = payload length (big-endian)** holds: each tag’s last payload block ends with the correct number of padding zeros (1–3 bytes), and the preceding bytes match the declared length.
 - **Last data block** is end-of-payload + zero padding to 4 bytes; no terminator sentinel. Use the header payload length to know how many bytes to take from the last block.
 
-So the header layout is **confirmed**: `[payload_len_hi, payload_len_lo, 0x01, 0x0C]`.
+So the header layout is **confirmed**: `[payload_len_hi, payload_len_lo, 0x01, 0x0C]` — i.e. block 0 is **length (bytes 0–1) / total capacity (bytes 2–3)**.
+
+### Block 1 (first payload block) — format byte 0x01
+
+The **first byte of block 1** is always **`0x01`** in every known tag. If that byte were part of the CCM ciphertext, it would vary per tag (ciphertext is effectively random). So it is **not** encrypted — it is either cleartext or AAD (additional authenticated data). The decrypt/analysis code treats it as a **format/version byte**; the remaining 3 bytes of block 1 (and all of blocks 2–N) are the encrypted payload. So block 1 = **format byte `01` (in the clear) + first 3 bytes of ciphertext**.
+
+**Format-byte experiments** (NfcCustomClone → experiment 6): Change the first byte of block 1 and write to a blank; note whether the brick recognizes, ignores, or red-flashes.
+
+| Format byte | Result |
+| ----------- | ------ |
+| `0x01` (original) | Recognized. |
+| `0x02` (Hyperdrive, block 1 `01391E39` → `02391E39`) | **Ignored** — brick does nothing (no red flash). |
+| `0x00` (Hyperdrive, block 1 → `00391E39`) | **Ignored.** |
+| `0xFF` (Hyperdrive, block 1 → `FF391E39`) | **Ignored.** |
+
+So the brick requires the format byte to be exactly `0x01`; any other value (0x00, 0x02, 0xFF) is treated like other invalid payloads (silent ignore, no red flash).
+
+### Header and payload validation (from clone experiments)
+
+Experiments with `NfcCustomClone` (modified block 0 or payload) show how the brick reacts:
+
+- **Capacity (bytes 2–3 of block 0):** Must be exactly **0x010C** (268). X-Wing with capacity 112 (`006B0070`) was rejected; same 28 blocks with original capacity 268 (`006B010C`) was accepted. So the brick requires the fixed capacity value; changing it to the physical tag size breaks recognition.
+- **Payload length (bytes 0–1):** Must be non-zero and **exact**. Length 0 → tag ignored. Wrong but non-zero (e.g. 15 instead of 107) → brick **flashes red continuously** (distinct error). Off-by-one (106 or 108 instead of 107) → tag ignored (no red flash). So bytes 0–1 are interpreted as payload length; only a “very wrong” value triggers red flash.
+- **Payload length vs content ID:** X-Wing and Tie Fighter both have 0x006B (107) and 107-byte payloads; if bytes 0–1 were a content/type ID, two different items sharing the same value would be a coincidence — so the payload-length interpretation fits.
+- **Truncated payload:** Lightsaber truncated to 28 blocks with block 0 rewritten to match (payload 108, capacity 112) was written successfully but the brick **did not recognize** the tag. So fixing the header is not sufficient; the brick likely validates the full ciphertext (e.g. AES-CCM MAC).
+- **Single-byte flip in ciphertext:** One bit flipped in a payload block → brick **ignores** the tag (no red flash). So MAC (or integrity) failure is silent, unlike a wrong header value which can trigger red flash.
+- **Swap headers:** Tie Fighter payload (28 blocks) with Vader’s block 0 (length 169) → ignored. Block 0 `FFFF010C` with 28 blocks → ignored. R2-D2 with length 75 instead of 74 → ignored.
 
 ## Data region (blocks 1–N)
 
@@ -98,13 +124,9 @@ Full analysis: [encryption-analysis.md](encryption-analysis.md).
 
 ## Cloning implications
 
-Since tag data is openly readable, identical across same-type tags, and not UID-bound:
+Since tag data is openly readable, identical across same-type tags, and not UID-bound, **byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically. The blank need not be the same chip (EM4233); blanks with different UIDs or vendors work. Factory tags are write-locked; use blank stickers. For the practical workflow and which tags fit which sticker sizes, see [cloning-guide.md](cloning-guide.md).
 
-- **Byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically to the original. The blank need not be the same chip as LEGO (EM4233, `E016`); blanks with different UIDs or vendors (e.g. `E004`) work.
-- The clone tool writes only the data blocks (stripping trailing zero filler and `0001` end markers).
-- Factory tags are permanently write-locked, so you need blank writable stickers. Smaller stickers (e.g. 112 bytes = 28 blocks) work for tags that fit (R2-D2, Tie Fighter, X-Wing). If a tag is too large for the sticker (partial write), the brick ignores the tag entirely — no error, no crash. **Truncate + fix header:** Writing a truncated tag (e.g. Lightsaber to 28 blocks) with block 0 updated to the new payload length and capacity still did not make the brick recognize it; the brick likely validates the full encrypted payload (e.g. AES-CCM MAC) rather than trusting the header alone. **Capacity field:** The brick appears to require block 0 bytes 2–3 to be **0x010C** (268). On a 112-byte sticker, X-Wing with capacity changed to 112 (`006B0070`) was rejected; the same 28 blocks with original capacity 268 (`006B010C`) was accepted. So when cloning to smaller stickers, keep the original header (do not rewrite capacity to the physical tag size). (The “truncated header” test with payload length 0: a clean test (zero-padded sticker) was rejected; the brick requires a non-zero payload length in the header.)
 
-See [cloning-guide.md](cloning-guide.md) for the practical workflow.
 
 ## Tools
 

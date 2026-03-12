@@ -171,6 +171,7 @@ defmodule NfcCustomClone do
     IO.puts("  3. Custom header-only tweak (edit block 0, optional truncate)")
     IO.puts("  4. Raw hex payload (paste full CLONE data)")
     IO.puts("  5. Flip one bit in a payload block (ciphertext corruption test)")
+    IO.puts("  6. Format byte: change first byte of block 1 (normally 0x01)")
     IO.puts("  q. Cancel\n")
 
     case IO.gets("Experiment: ") do
@@ -185,6 +186,7 @@ defmodule NfcCustomClone do
           "3" -> experiment_custom_header(blocks, opts)
           "4" -> experiment_raw_hex(opts)
           "5" -> experiment_flip_bit(blocks, opts)
+          "6" -> experiment_format_byte(blocks, opts)
           _ ->
             IO.puts("Cancelled.")
             :ok
@@ -452,6 +454,62 @@ defmodule NfcCustomClone do
         :error ->
           IO.puts("Invalid block hex (must be 8 hex chars).")
           :error
+      end
+    end
+  end
+
+  defp experiment_format_byte(blocks, opts) do
+    blocks = strip_trailing_filler(blocks)
+
+    if length(blocks) < 2 do
+      IO.puts("Need at least 2 blocks (header + block 1).")
+      :error
+    else
+      block1 = Enum.at(blocks, 1)
+      current_byte_hex = String.slice(block1, 0, 2)
+      current_byte = String.to_integer(current_byte_hex, 16)
+      IO.puts("\nBlock 1: #{block1}  (first byte = 0x#{String.upcase(current_byte_hex)} = #{current_byte})")
+      IO.puts("Normal value is 0x01. Try 0x00, 0x02, 0xFF to see how the brick reacts.\n")
+
+      new_byte =
+        case IO.gets("New format byte (hex 00-FF or decimal 0-255; default 01): ") do
+          :eof -> 0x01
+          input ->
+            s = String.trim(to_string(input))
+            cond do
+              s == "" -> 0x01
+              # One or two hex digits (e.g. 0, 01, 00, FF)
+              String.match?(s, ~r/^[0-9A-Fa-f]{1,2}$/) ->
+                String.to_integer(String.pad_leading(s, 2, "0"), 16)
+              true ->
+                case Integer.parse(s) do
+                  {n, ""} when n in 0..255 -> n
+                  _ ->
+                    IO.puts("Invalid; using 0x01.")
+                    0x01
+                end
+            end
+        end
+
+      new_byte_hex = new_byte |> Integer.to_string(16) |> String.pad_leading(2, "0") |> String.upcase()
+      rest_of_block1 = String.slice(block1, 2, 6)
+      new_block1 = new_byte_hex <> rest_of_block1
+      modified = List.replace_at(blocks, 1, new_block1)
+
+      IO.puts("\n[EXPERIMENT] Format byte: block 1 first byte 0x#{current_byte_hex} -> 0x#{new_byte_hex}")
+      IO.puts("Block 1: #{block1} -> #{new_block1}")
+
+      case prompt_blocks_to_write(modified) do
+        :cancel ->
+          IO.puts("Cancelled.")
+          :ok
+
+        {:ok, to_write} ->
+          IO.puts("Blocks to write: #{length(to_write)}" <> padding_suffix(modified, to_write))
+          case confirm_write() do
+            :cancel -> IO.puts("Cancelled."); :ok
+            :confirm -> do_clone_blocks(to_write, opts)
+          end
       end
     end
   end

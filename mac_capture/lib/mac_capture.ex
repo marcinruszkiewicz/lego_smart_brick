@@ -15,7 +15,6 @@ defmodule MacCapture do
   """
 
   @default_baud 115200
-  @read_timeout_ms 500
   @nfc_prefix "NFC15693:"
   @sysinfo_prefix "SYSINFO:"
   @secstatus_prefix "SECSTATUS:"
@@ -61,7 +60,8 @@ defmodule MacCapture do
 
       item = prompt_scan_item()
       IO.puts("Scanning: #{if item == "", do: "(no label)", else: item}")
-      IO.puts("Press Ctrl+C to stop.\n")
+      IO.puts("Press Ctrl+C to stop.")
+      IO.puts("Place the tag on the reader now (or remove and re-place if it's already there).\n")
 
       debug = opts[:debug] == true
 
@@ -105,11 +105,12 @@ defmodule MacCapture do
   end
 
   defp open_and_capture(pid, port, baud, output_path, item, debug) do
-    opts = [speed: baud, active: false]
+    # active: true so this process receives UART data as messages while we wait for prompt
+    opts = [speed: baud, active: true]
 
     case Circuits.UART.open(pid, port, opts) do
       :ok ->
-        stream_capture(pid, output_path, "", item, debug)
+        receive_loop(output_path, {item, [], ""}, debug)
       {:error, :einval} ->
         IO.puts("Failed to open #{port}: invalid argument (:einval).")
         IO.puts("  → Close the Arduino IDE Serial Monitor (or any other app using this port) and try again.")
@@ -120,24 +121,80 @@ defmodule MacCapture do
     end
   end
 
-  defp stream_capture(pid, output_path, buffer, item, debug) do
-    case Circuits.UART.read(pid, @read_timeout_ms) do
-      {:ok, <<>>} ->
-        stream_capture(pid, output_path, buffer, item, debug)
+  defp receive_loop(output_path, state, debug) do
+    new_state =
+      receive do
+        {:circuits_uart, _port_id, data} when is_binary(data) ->
+          handle_uart_data(data, output_path, state, debug)
+        {:circuits_uart, _port_id, {:error, _reason}} ->
+          state
+        {:next_item, value} ->
+          handle_next_item(value, output_path, state, debug)
+      end
+    receive_loop(output_path, new_state, debug)
+  end
 
-      {:ok, data} ->
-        new_buffer = buffer <> data
-        {lines, rest} = split_lines(new_buffer)
-        next_item =
-          Enum.reduce(lines, item, fn line, current_item ->
-            process_line(line, output_path, current_item, debug)
-          end)
-
-        stream_capture(pid, output_path, rest, next_item, debug)
-
-      {:error, _reason} ->
-        stream_capture(pid, output_path, buffer, item, debug)
+  defp handle_uart_data(data, output_path, {current_item, queue, buffer}, debug) do
+    new_buffer = buffer <> data
+    {lines, rest} = split_lines(new_buffer)
+    if debug and length(lines) > 0 do
+      nfc_count = Enum.count(lines, &String.starts_with?(&1, @nfc_prefix))
+      if nfc_count > 0, do: IO.puts("  < [capture] #{length(lines)} line(s), #{nfc_count} NFC15693")
     end
+    state = {current_item, queue, rest}
+    Enum.reduce(lines, state, fn line, acc ->
+      {item, q, buf} = acc
+      {new_item, new_queue, _} = handle_uart_line(line, output_path, {item, q, buf}, debug)
+      {new_item, new_queue, buf}
+    end)
+  end
+
+  defp handle_uart_line(line, output_path, {current_item, queue, buffer}, debug) do
+    case process_line(line, output_path, debug) do
+      :no_tag ->
+        {current_item, queue, buffer}
+      {:tag, map} ->
+        if current_item != :pending do
+          append_and_save(map, output_path, current_item)
+          request_next_item()
+          {:pending, queue, buffer}
+        else
+          {:pending, queue ++ [map], buffer}
+        end
+    end
+  end
+
+  defp handle_next_item(value, output_path, {:pending, queue, buffer}, _debug) do
+    case queue do
+      [] ->
+        IO.puts("Next scan: #{if value == "", do: "(no label)", else: value}\n")
+        {value, [], buffer}
+      [tag | rest] ->
+        append_and_save(tag, output_path, value)
+        IO.puts("Next scan: #{if value == "", do: "(no label)", else: value}\n")
+        request_next_item()
+        {:pending, rest, buffer}
+    end
+  end
+
+  defp request_next_item do
+    main = self()
+    Task.start(fn ->
+      item = prompt_scan_item()
+      send(main, {:next_item, item})
+    end)
+  end
+
+  defp append_and_save(map, output_path, item) do
+    map = Map.put(map, "item", item)
+    uid = Map.get(map, "uid", "")
+    blocks = Map.get(map, "blocks", [])
+    block_count = length(blocks)
+    first_blocks = Enum.take(blocks, 3) |> Enum.join(", ")
+
+    File.write!(output_path, JSON.encode!(map) <> "\n", [:append])
+    label = if item == "", do: "", else: " item=#{item}"
+    IO.puts("[NFC] uid=#{uid} blocks=#{block_count}#{label}  first=#{first_blocks}")
   end
 
   defp split_lines(binary) do
@@ -156,14 +213,14 @@ defmodule MacCapture do
     end
   end
 
-  defp process_line(line, output_path, item, debug) do
+  defp process_line(line, _output_path, debug) do
     line = String.trim(line)
     cond do
       line == "" ->
-        item
+        :no_tag
       String.starts_with?(line, "[D]") or String.starts_with?(line, "[DEBUG]") ->
         if debug, do: IO.puts("  < #{line}")
-        item
+        :no_tag
       String.starts_with?(line, @sysinfo_prefix) ->
         json_str = String.trim_leading(line, @sysinfo_prefix)
         case JSON.decode(json_str) do
@@ -186,7 +243,7 @@ defmodule MacCapture do
             IO.puts("[SYSINFO] #{mfr} ic_ref=0x#{ic_ref} blocks=#{num_blocks}x#{block_size}#{total}")
           _ -> :ok
         end
-        item
+        :no_tag
       String.starts_with?(line, @secstatus_prefix) ->
         json_str = String.trim_leading(line, @secstatus_prefix)
         case JSON.decode(json_str) do
@@ -196,18 +253,21 @@ defmodule MacCapture do
             IO.puts("[SECSTATUS] #{locked}/#{count} blocks locked")
           _ -> :ok
         end
-        item
+        :no_tag
       true ->
         json_str = strip_prefix(line)
         case JSON.decode(json_str) do
           {:ok, map} when is_map(map) ->
             if Map.has_key?(map, "uid") and Map.has_key?(map, "blocks") do
-              append_and_prompt_next(map, output_path, item)
+              {:tag, map}
             else
-              item
+              :no_tag
             end
           _ ->
-            item
+            if debug and String.starts_with?(line, @nfc_prefix) do
+              IO.puts("  < [capture] NFC15693 line received but parse failed (incomplete chunk?)")
+            end
+            :no_tag
         end
     end
   end
@@ -220,18 +280,4 @@ defmodule MacCapture do
     end
   end
 
-  defp append_and_prompt_next(map, output_path, item) do
-    map = Map.put(map, "item", item)
-    uid = Map.get(map, "uid", "")
-    blocks = Map.get(map, "blocks", [])
-    block_count = length(blocks)
-    first_blocks = Enum.take(blocks, 3) |> Enum.join(", ")
-
-    File.write!(output_path, JSON.encode!(map) <> "\n", [:append])
-    label = if item == "", do: "", else: " item=#{item}"
-    IO.puts("[NFC] uid=#{uid} blocks=#{block_count}#{label}  first=#{first_blocks}")
-    next_item = prompt_scan_item()
-    IO.puts("Next scan: #{if next_item == "", do: "(no label)", else: next_item}\n")
-    next_item
-  end
 end
