@@ -31,9 +31,22 @@ defmodule NfcDecrypt do
   @tea_delta 0x9E3779B9
   @mask32 0xFFFFFFFF
 
+  # Skip test/modified tag copies: item/label contains [FAIL] or [RED FLASH]
+  defp skip_test_tag?(tag) do
+    label = Map.get(tag, "item", tag["uid"] || "") |> String.downcase()
+    String.contains?(label, "[fail]") or String.contains?(label, "[red flash]")
+  end
+
+  defp drop_test_tags(tags) do
+    Enum.reject(tags, &skip_test_tag?/1)
+  end
+
   def run(jsonl_path \\ nil, opts \\ []) do
     path = jsonl_path || default_dump_path()
-    tags = load_tags(path)
+    raw = load_tags(path)
+    tags = drop_test_tags(raw)
+    skipped = length(raw) - length(tags)
+    if skipped > 0, do: IO.puts("Skipped #{skipped} test tag(s) ([FAIL] / [RED FLASH])\n")
     IO.puts("Loaded #{length(tags)} tag(s) from #{path}\n")
 
     # Dedupe by payload so we don't double-count identical tags (e.g. two Lukes)
@@ -99,6 +112,10 @@ defmodule NfcDecrypt do
       Path.wildcard(Path.join(data_dir, "*.jsonl"))
     end
     tags = Enum.flat_map(paths, &load_tags/1)
+    raw_count = length(tags)
+    tags = drop_test_tags(tags)
+    skipped = raw_count - length(tags)
+    if skipped > 0, do: IO.puts("Skipped #{skipped} test tag(s) ([FAIL] / [RED FLASH])\n")
     IO.puts("Loaded #{length(tags)} tag(s) from #{length(paths)} file(s): #{Enum.join(paths, ", ")}\n")
     unique = dedupe_by_payload(tags)
     IO.puts("Unique payloads: #{length(unique)} (by content)\n")
@@ -126,6 +143,15 @@ defmodule NfcDecrypt do
 
     IO.puts("\n=== Known-plaintext: event type magic recovery (stream cipher test) ===")
     try_known_plaintext_magic(unique)
+
+    IO.puts("\n=== MAC length inference (enc_len - 4/8/16 per tag) ===")
+    mac_length_inference(unique)
+
+    IO.puts("\n=== Keystream extended (bytes 8-15: assume zero padding) ===")
+    try_keystream_extended(unique)
+
+    IO.puts("\n=== Constrain P[0:3] (type_id + content_len → K[0:3] consistency) ===")
+    try_constrain_p0_p3(unique)
 
     IO.puts("\n=== TEA / XTEA with candidate keys (cross-tag validated) ===")
     try_tea_xtea_all(unique)
@@ -1035,12 +1061,35 @@ defmodule NfcDecrypt do
 
     crc_pts = check_crc32_presence(dec_bytes)
 
-    total = entropy_pts + ascii_pts + pad_pts + tlv_pts + magic_pts + crc_pts
+    tlv_chain_pts = tlv_chain_score(dec_bytes, enc_len)
+
+    total = entropy_pts + ascii_pts + pad_pts + tlv_pts + magic_pts + crc_pts + tlv_chain_pts
     {total, %{ent: Float.round(entropy, 2), ascii: Float.round(ascii_pts, 1), pad: pad_pts,
-              tlv: tlv_pts, magic: magic_pts, crc: crc_pts}}
+              tlv: tlv_pts, magic: magic_pts, crc: crc_pts, tlv_chain: tlv_chain_pts}}
   end
 
   defp relaxed_score(_dec_bytes, _enc_len), do: {0.0, %{}}
+
+  # Score if first TLV content_len implies next TLV starts in-bounds and looks plausible
+  defp tlv_chain_score(dec_bytes, enc_len) when length(dec_bytes) >= 8 do
+    len_lo = Enum.at(dec_bytes, 2)
+    len_hi = Enum.at(dec_bytes, 3)
+    content_len = len_lo + bsl(len_hi, 8)
+    next_start = 8 + content_len
+    if next_start + 8 <= length(dec_bytes) do
+      next_hi = Enum.at(dec_bytes, next_start + 1)
+      next_len_lo = Enum.at(dec_bytes, next_start + 2)
+      next_len_hi = Enum.at(dec_bytes, next_start + 3)
+      next_len = next_len_lo + bsl(next_len_hi, 8)
+      type_ok = (next_hi &&& 0xC0) == 0
+      len_ok = next_len >= 0 and next_len <= enc_len
+      if type_ok and len_ok, do: 20, else: 0
+    else
+      0
+    end
+  end
+
+  defp tlv_chain_score(_, _), do: 0
 
   defp check_crc32_presence(dec_bytes) when length(dec_bytes) >= 8 do
     bin = IO.iodata_to_binary(dec_bytes)
@@ -1096,6 +1145,78 @@ defmodule NfcDecrypt do
     if length(all_ks) > 1 do
       IO.puts("  K[4:7] differs across tags — NOT a simple fixed-keystream cipher")
       IO.puts("  (could be content-dependent IV/nonce, block cipher, or per-tag key derivation)")
+    end
+    IO.puts("")
+  end
+
+  # --- MAC length inference: enc_len - 4/8/16 = plaintext_len ---
+  defp mac_length_inference(unique_tags) do
+    by_cat = Enum.group_by(unique_tags, &tag_category/1)
+    for {cat, tags} <- by_cat do
+      IO.puts("  --- #{cat} (#{length(tags)} tags) ---")
+      for tag <- tags do
+        enc = encrypted_binary(tag)
+        enc_len = byte_size(enc)
+        pt_4 = enc_len - 4
+        pt_8 = enc_len - 8
+        pt_16 = enc_len - 16
+        IO.puts("    #{tag_label(tag)}: enc=#{enc_len}  plaintext_len if MAC=4/8/16: #{pt_4} / #{pt_8} / #{pt_16}")
+      end
+      enc_lens = Enum.map(tags, fn t -> byte_size(encrypted_binary(t)) end) |> Enum.uniq() |> Enum.sort()
+      IO.puts("    enc_len values: #{Enum.join(enc_lens, ", ")}")
+    end
+    IO.puts("")
+  end
+
+  # --- Keystream at bytes 8-15: if first TLV content is short, bytes 8+ may be zero padding ---
+  defp try_keystream_extended(unique_tags) do
+    by_cat = Enum.group_by(unique_tags, &tag_category/1)
+    for {cat, tags} <- by_cat, length(tags) >= 1 do
+      enc_list = Enum.map(tags, fn t -> encrypted_binary(t) end)
+      min_len = enc_list |> Enum.map(&byte_size/1) |> Enum.min()
+      if min_len >= 16 do
+        bytes_8_15 = Enum.map(enc_list, fn enc -> binary_part(enc, 8, 8) end)
+        uniq = Enum.uniq(bytes_8_15)
+        IO.puts("  #{cat}: #{length(tags)} tags, bytes 8-15: #{length(uniq)} unique")
+        if length(uniq) == 1 and length(tags) > 1 do
+          IO.puts("    >>> All #{cat} tags identical at 8-15 — consistent with same plaintext/keystream")
+        end
+      end
+    end
+    IO.puts("")
+  end
+
+  # --- Constrain P[0:3]: enumerate type_id (0x0000..0x0FFF) and content_len, compute K[0:3] = C[0:3] ⊕ P ---
+  defp try_constrain_p0_p3(unique_tags) do
+    by_cat = Enum.group_by(unique_tags, &tag_category/1)
+    for {cat, tags} <- by_cat, length(tags) >= 1 do
+      enc_list = Enum.map(tags, fn t -> encrypted_binary(t) end)
+      if Enum.all?(enc_list, fn enc -> byte_size(enc) >= 4 end) do
+        # For each (type_id, content_len) try content_len in [enc_len-8, enc_len-12, ...] plausible range
+        first_enc = List.first(enc_list)
+        enc_len = byte_size(first_enc)
+        content_len_opts = [enc_len - 8, enc_len - 12, enc_len - 16, max(0, enc_len - 20)] |> Enum.uniq() |> Enum.filter(&(&1 >= 0))
+        hits = for type_id <- 0..0x0FFF,
+                  content_len <- content_len_opts,
+                  content_len <= 300 do
+          pt = <<type_id::16-little, content_len::16-little>>
+          # K[0:3] = C[0:3] ⊕ P[0:3] for first tag
+          c0 = binary_part(first_enc, 0, 4) |> :binary.bin_to_list()
+          p0 = :binary.bin_to_list(pt)
+          k0 = Enum.zip(c0, p0) |> Enum.map(fn {a, b} -> bxor(a, b) end)
+          # Check if same K[0:3] decrypts other tags to plausible TLV (type_ok, len_ok at 0-3)
+          all_ok = Enum.all?(enc_list, fn enc ->
+            if byte_size(enc) < 4, do: false, else: true
+          end)
+          {type_id, content_len, k0, all_ok}
+        end
+        best = Enum.take(hits, 5)
+        IO.puts("  #{cat}: sampled type_id/content_len → K[0:3] (first 5)")
+        for {tid, clen, k0, _} <- best do
+          k_hex = k0 |> Enum.map(fn b -> Integer.to_string(b, 16) |> String.pad_leading(2, "0") end) |> Enum.join(" ")
+          IO.puts("    type_id=0x#{Integer.to_string(tid, 16)} content_len=#{clen}  K[0:3]=#{k_hex}")
+        end
+      end
     end
     IO.puts("")
   end
@@ -1359,7 +1480,7 @@ defmodule NfcDecrypt do
           IO.puts("      XOR[0:15]: #{hex16}")
           if zeros > 0 do
             zpos = xor |> Enum.with_index() |> Enum.filter(fn {b, _} -> b == 0 end) |> Enum.map(&elem(&1, 1))
-            IO.puts("      zero at: #{inspect(Enum.take(zpos, 20))}")
+            IO.puts("      zero at: #{Enum.take(zpos, 20) |> Enum.join(", ")}")
           end
         end
         IO.puts("")
@@ -1914,12 +2035,16 @@ defmodule NfcDecrypt do
       Path.wildcard(Path.join(data_dir, "*.jsonl"))
     end
     tags = Enum.flat_map(paths, &load_tags/1)
+    raw_count = length(tags)
+    tags = drop_test_tags(tags)
+    skipped = raw_count - length(tags)
+    if skipped > 0, do: IO.puts("Skipped #{skipped} test tag(s) ([FAIL] / [RED FLASH])\n")
     IO.puts("Loaded #{length(tags)} tag(s) from #{length(paths)} file(s)\n")
     unique = dedupe_by_payload(tags)
     IO.puts("Unique payloads: #{length(unique)}\n")
 
-    keys = load_all_candidate_keys()
-    IO.puts("Loaded #{length(keys)} candidate keys\n")
+    keys = load_all_candidate_keys() ++ tag_derived_candidate_keys(unique)
+    IO.puts("Loaded #{length(keys)} candidate keys (including tag-derived)\n")
 
     IO.puts(String.duplicate("=", 70))
     IO.puts("AES-128-CCM BRUTE FORCE")
@@ -1949,7 +2074,30 @@ defmodule NfcDecrypt do
     IO.puts("\n=== Strategy 4: Fixed nonce (all zeros) ===")
     hit4 = try_ccm_fixed_nonce(unique, keys)
 
-    any_hit = hit1 || hit2 || hit3 || hit4
+    # Strategy 5: MAC at start
+    IO.puts("\n=== Strategy 5: MAC at start of encrypted region ===")
+    hit5 = try_ccm_mac_at_start(unique, keys)
+
+    # Strategy 6: Nonce = hash(header)
+    IO.puts("\n=== Strategy 6: Nonce = hash(cleartext header) ===")
+    hit6 = try_ccm_nonce_hash_header(unique, keys)
+
+    # Strategy 7: Nonce = hash(category)
+    IO.puts("\n=== Strategy 7: Nonce = hash(category) ===")
+    hit7 = try_ccm_nonce_hash_category(unique, keys)
+
+    # Strategy 8: Nonce = payload_len + zeros
+    IO.puts("\n=== Strategy 8: Nonce = payload_len + zeros ===")
+    hit8 = try_ccm_nonce_payload_len(unique, keys)
+
+    # AES-GCM and ChaCha20-Poly1305 (sanity check)
+    IO.puts("\n=== Strategy 9: AES-128-GCM ===")
+    hit9 = try_aead_gcm(unique, keys)
+
+    IO.puts("\n=== Strategy 10: ChaCha20-Poly1305 ===")
+    hit10 = try_aead_chacha20(unique, keys)
+
+    any_hit = hit1 || hit2 || hit3 || hit4 || hit5 || hit6 || hit7 || hit8 || hit9 || hit10
     IO.puts("\n" <> String.duplicate("=", 70))
     if any_hit do
       IO.puts("SUCCESS: AES-CCM key found! See HIT lines above.")
@@ -1968,6 +2116,35 @@ defmodule NfcDecrypt do
     builtin = candidate_keys()
     all = (builtin ++ fw_keys) |> Enum.uniq()
     all
+  end
+
+  # Keys derived from tag constants (magic, header, 0x010C) for tags-only attacks
+  defp tag_derived_candidate_keys(tags) do
+    first = List.first(tags)
+
+    keys = [
+      :crypto.hash(:sha256, @identity_event_magic) |> binary_part(0, 16),
+      :crypto.hash(:sha256, @item_event_magic) |> binary_part(0, 16),
+      :crypto.hash(:sha256, <<0x01, 0x0C>>) |> binary_part(0, 16),
+      :crypto.hash(:sha256, "identity") |> binary_part(0, 16),
+      :crypto.hash(:sha256, "item") |> binary_part(0, 16),
+      pad16("0x010C"),
+      pad16(<<0x01, 0x0C>>),
+    ]
+
+    extra = if first do
+      header5 = cleartext_header(first)
+      block0 = Enum.at(first["blocks"], 0) || "00000000"
+      block0_bin = Base.decode16!(String.pad_trailing(String.upcase(block0), 8, "0"), case: :mixed)
+      [
+        :crypto.hash(:sha256, header5) |> binary_part(0, 16),
+        :crypto.hash(:sha256, block0_bin) |> binary_part(0, 16),
+      ]
+    else
+      []
+    end
+
+    (keys ++ extra) |> Enum.uniq()
   end
 
   defp load_firmware_candidate_keys do
@@ -2009,15 +2186,6 @@ defmodule NfcDecrypt do
     enc = encrypted_binary(first_tag)
     enc_len = byte_size(enc)
 
-    aad_options = [
-      {"empty", fn _tag -> <<>> end},
-      {"header4", fn tag ->
-        hex = Enum.at(tag["blocks"], 0) || "00000000"
-        Base.decode16!(String.upcase(hex), case: :mixed)
-      end},
-      {"format_byte", fn _tag -> <<0x01>> end},
-    ]
-
     hit = Enum.find_value(keys, fn key ->
       Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
         Enum.find_value(@ccm_mac_lengths, fn mac_len ->
@@ -2025,17 +2193,17 @@ defmodule NfcDecrypt do
           if enc_len < min_data do
             nil
           else
-            Enum.find_value(aad_options, fn {aad_name, aad_fn} ->
+            Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
               nonce = binary_part(enc, 0, nonce_len)
               ciphertext = binary_part(enc, nonce_len, enc_len - nonce_len - mac_len)
               mac = binary_part(enc, enc_len - mac_len, mac_len)
+              aad = aad_fn.(first_tag)
 
-              case ccm_decrypt(key, nonce, ciphertext, <<>>, mac) do
+              case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
                 {:ok, _plaintext} ->
-                  # Verify on all tags with the same structure
                   {pass, total} = validate_ccm_on_all(tags, key, nonce_len, mac_len, aad_fn)
                   if pass >= 1 do
-                    report_ccm_hit(key, nonce_len, mac_len, aad_name, "embedded_nonce", pass, total, tags)
+                    report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "embedded_nonce", pass, total, tags)
                     true
                   end
                 _ -> nil
@@ -2055,28 +2223,31 @@ defmodule NfcDecrypt do
     hit = Enum.find_value(keys, fn key ->
       Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
         Enum.find_value(@ccm_mac_lengths, fn mac_len ->
-          results = Enum.map(tags, fn tag ->
-            enc = encrypted_binary(tag)
-            enc_len = byte_size(enc)
-            if enc_len < mac_len + 1 do
-              :skip
-            else
-              nonce = uid_to_nonce(tag, nonce_len)
-              ciphertext = binary_part(enc, 0, enc_len - mac_len)
-              mac = binary_part(enc, enc_len - mac_len, mac_len)
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                nonce = uid_to_nonce(tag, nonce_len)
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
 
-              case ccm_decrypt(key, nonce, ciphertext, <<>>, mac) do
-                {:ok, _} -> :pass
-                _ -> :fail
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
               end
+            end)
+
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= max(1, div(length(tags), 2)) do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "uid_nonce", pass, length(tags), tags)
+              true
             end
           end)
-
-          pass = Enum.count(results, &(&1 == :pass))
-          if pass >= max(1, div(length(tags), 2)) do
-            report_ccm_hit(key, nonce_len, mac_len, "uid_derived", "uid_nonce", pass, length(tags), tags)
-            true
-          end
         end)
       end)
     end)
@@ -2090,28 +2261,31 @@ defmodule NfcDecrypt do
     hit = Enum.find_value(keys, fn key ->
       Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
         Enum.find_value(@ccm_mac_lengths, fn mac_len ->
-          results = Enum.map(tags, fn tag ->
-            enc = encrypted_binary(tag)
-            enc_len = byte_size(enc)
-            if enc_len < mac_len + 1 do
-              :skip
-            else
-              nonce = header_to_nonce(tag, nonce_len)
-              ciphertext = binary_part(enc, 0, enc_len - mac_len)
-              mac = binary_part(enc, enc_len - mac_len, mac_len)
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                nonce = header_to_nonce(tag, nonce_len)
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
 
-              case ccm_decrypt(key, nonce, ciphertext, <<>>, mac) do
-                {:ok, _} -> :pass
-                _ -> :fail
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
               end
+            end)
+
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= max(1, div(length(tags), 2)) do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "header_nonce", pass, length(tags), tags)
+              true
             end
           end)
-
-          pass = Enum.count(results, &(&1 == :pass))
-          if pass >= max(1, div(length(tags), 2)) do
-            report_ccm_hit(key, nonce_len, mac_len, "header_derived", "header_nonce", pass, length(tags), tags)
-            true
-          end
         end)
       end)
     end)
@@ -2125,35 +2299,328 @@ defmodule NfcDecrypt do
     hit = Enum.find_value(keys, fn key ->
       Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
         Enum.find_value(@ccm_mac_lengths, fn mac_len ->
-          nonce = :binary.copy(<<0>>, nonce_len)
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            nonce = :binary.copy(<<0>>, nonce_len)
 
-          results = Enum.map(tags, fn tag ->
-            enc = encrypted_binary(tag)
-            enc_len = byte_size(enc)
-            if enc_len < mac_len + 1 do
-              :skip
-            else
-              ciphertext = binary_part(enc, 0, enc_len - mac_len)
-              mac = binary_part(enc, enc_len - mac_len, mac_len)
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
 
-              case ccm_decrypt(key, nonce, ciphertext, <<>>, mac) do
-                {:ok, _} -> :pass
-                _ -> :fail
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
               end
+            end)
+
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= 1 do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "fixed_zeros", pass, length(tags), tags)
+              true
             end
           end)
-
-          pass = Enum.count(results, &(&1 == :pass))
-          if pass >= 1 do
-            report_ccm_hit(key, nonce_len, mac_len, "empty", "fixed_zeros", pass, length(tags), tags)
-            true
-          end
         end)
       end)
     end)
 
     unless hit, do: IO.puts("  No hits with fixed zero nonce strategy")
     hit
+  end
+
+  # Strategy 5: MAC at start of encrypted region — [MAC | nonce | ciphertext]
+  defp try_ccm_mac_at_start(tags, keys) do
+    first_tag = List.first(tags)
+    enc = encrypted_binary(first_tag)
+    enc_len = byte_size(enc)
+
+    hit = Enum.find_value(keys, fn key ->
+      Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
+        Enum.find_value(@ccm_mac_lengths, fn mac_len ->
+          min_data = mac_len + nonce_len + mac_len + 1
+          if enc_len < min_data do
+            nil
+          else
+            Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+              mac = binary_part(enc, 0, mac_len)
+              nonce = binary_part(enc, mac_len, nonce_len)
+              ciphertext = binary_part(enc, mac_len + nonce_len, enc_len - mac_len - nonce_len)
+              aad = aad_fn.(first_tag)
+
+              case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                {:ok, _plaintext} ->
+                  {pass, total} = validate_ccm_mac_at_start(tags, key, nonce_len, mac_len, aad_fn)
+                  if pass >= 1 do
+                    report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "mac_at_start", pass, total, tags)
+                    true
+                  end
+                _ -> nil
+              end
+            end)
+          end
+        end)
+      end)
+    end)
+
+    unless hit, do: IO.puts("  No hits with MAC-at-start strategy")
+    hit
+  end
+
+  defp validate_ccm_mac_at_start(tags, key, nonce_len, mac_len, aad_fn) do
+    results = Enum.map(tags, fn tag ->
+      enc = encrypted_binary(tag)
+      enc_len = byte_size(enc)
+      if enc_len < mac_len + nonce_len + mac_len + 1 do
+        :skip
+      else
+        mac = binary_part(enc, 0, mac_len)
+        nonce = binary_part(enc, mac_len, nonce_len)
+        ciphertext = binary_part(enc, mac_len + nonce_len, enc_len - mac_len - nonce_len)
+        aad = aad_fn.(tag)
+        case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+          {:ok, _} -> :pass
+          _ -> :fail
+        end
+      end
+    end)
+    pass = Enum.count(results, &(&1 == :pass))
+    total = Enum.count(results, &(&1 != :skip))
+    {pass, total}
+  end
+
+  # Nonce = first N bytes of hash(header)
+  defp nonce_hash_header(tag, nonce_len) do
+    h = cleartext_header(tag)
+    hash = :crypto.hash(:sha256, h)
+    binary_part(hash, 0, min(nonce_len, byte_size(hash)))
+  end
+
+  # Nonce = first N bytes of hash("identity") or hash("item")
+  defp nonce_hash_category(tag, nonce_len) do
+    cat = case tag_category(tag) do
+      :identity -> "identity"
+      :item -> "item"
+      _ -> "unknown"
+    end
+    hash = :crypto.hash(:sha256, cat)
+    binary_part(hash, 0, min(nonce_len, byte_size(hash)))
+  end
+
+  # Nonce = payload_len (2 bytes) + zeros to nonce_len
+  defp nonce_payload_len(tag, nonce_len) do
+    hex = Enum.at(tag["blocks"], 0) || "00000000"
+    bin = Base.decode16!(String.pad_trailing(String.upcase(hex), 8, "0"), case: :mixed)
+    len_2 = if byte_size(bin) >= 2, do: binary_part(bin, 0, 2), else: <<0, 0>>
+    pad = nonce_len - 2
+    if pad <= 0 do
+      binary_part(len_2, 0, nonce_len)
+    else
+      len_2 <> :binary.copy(<<0>>, pad)
+    end
+  end
+
+  # Strategy 6: Nonce = hash(cleartext header) truncated
+  defp try_ccm_nonce_hash_header(tags, keys) do
+    hit = Enum.find_value(keys, fn key ->
+      Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
+        Enum.find_value(@ccm_mac_lengths, fn mac_len ->
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                nonce = nonce_hash_header(tag, nonce_len)
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
+              end
+            end)
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= max(1, div(length(tags), 2)) do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "hash_header", pass, length(tags), tags)
+              true
+            end
+          end)
+        end)
+      end)
+    end)
+    unless hit, do: IO.puts("  No hits with nonce=hash(header) strategy")
+    hit
+  end
+
+  # Strategy 7: Nonce = hash(category) truncated
+  defp try_ccm_nonce_hash_category(tags, keys) do
+    hit = Enum.find_value(keys, fn key ->
+      Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
+        Enum.find_value(@ccm_mac_lengths, fn mac_len ->
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                nonce = nonce_hash_category(tag, nonce_len)
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
+              end
+            end)
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= max(1, div(length(tags), 2)) do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "hash_category", pass, length(tags), tags)
+              true
+            end
+          end)
+        end)
+      end)
+    end)
+    unless hit, do: IO.puts("  No hits with nonce=hash(category) strategy")
+    hit
+  end
+
+  # Strategy 8: Nonce = payload_len (2 bytes) + zeros
+  defp try_ccm_nonce_payload_len(tags, keys) do
+    hit = Enum.find_value(keys, fn key ->
+      Enum.find_value(@ccm_nonce_lengths, fn nonce_len ->
+        Enum.find_value(@ccm_mac_lengths, fn mac_len ->
+          Enum.find_value(ccm_aad_options(), fn {aad_name, aad_fn} ->
+            results = Enum.map(tags, fn tag ->
+              enc = encrypted_binary(tag)
+              enc_len = byte_size(enc)
+              if enc_len < mac_len + 1 do
+                :skip
+              else
+                nonce = nonce_payload_len(tag, nonce_len)
+                ciphertext = binary_part(enc, 0, enc_len - mac_len)
+                mac = binary_part(enc, enc_len - mac_len, mac_len)
+                aad = aad_fn.(tag)
+                case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
+                  {:ok, _} -> :pass
+                  _ -> :fail
+                end
+              end
+            end)
+            pass = Enum.count(results, &(&1 == :pass))
+            if pass >= max(1, div(length(tags), 2)) do
+              report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, "payload_len_nonce", pass, length(tags), tags)
+              true
+            end
+          end)
+        end)
+      end)
+    end)
+    unless hit, do: IO.puts("  No hits with nonce=payload_len+zeros strategy")
+    hit
+  end
+
+  # Strategy 9: AES-128-GCM (same nonce/layout ideas as CCM)
+  @gcm_iv_lengths [12]
+  @gcm_tag_lengths [16, 12]
+
+  defp try_aead_gcm(tags, keys) do
+    hit = Enum.find_value(keys, fn key ->
+      Enum.find_value(@gcm_iv_lengths, fn iv_len ->
+        Enum.find_value(@gcm_tag_lengths, fn tag_len ->
+          results = Enum.map(tags, fn tag ->
+            enc = encrypted_binary(tag)
+            enc_len = byte_size(enc)
+            if enc_len < iv_len + tag_len + 1 do
+              :skip
+            else
+              iv = header_to_nonce(tag, iv_len)
+              ciphertext = binary_part(enc, 0, enc_len - tag_len)
+              tag_bin = binary_part(enc, enc_len - tag_len, tag_len)
+              case gcm_decrypt(key, iv, ciphertext, <<>>, tag_bin) do
+                {:ok, _} -> :pass
+                _ -> :fail
+              end
+            end
+          end)
+          pass = Enum.count(results, &(&1 == :pass))
+          if pass >= max(1, div(length(tags), 2)) do
+            IO.puts("  !!! AES-GCM HIT: iv=header(#{iv_len}) tag=#{tag_len} pass=#{pass}/#{length(tags)}")
+            true
+          end
+        end)
+      end)
+    end)
+    unless hit, do: IO.puts("  No hits with AES-GCM")
+    hit
+  end
+
+  defp gcm_decrypt(key, iv, ciphertext, aad, tag) do
+    try do
+      case :crypto.crypto_one_time_aead(:aes_128_gcm, key, iv, ciphertext, aad, tag, false) do
+        :error -> :error
+        plaintext when is_binary(plaintext) -> {:ok, plaintext}
+      end
+    rescue
+      _ -> :error
+    catch
+      _, _ -> :error
+    end
+  end
+
+  # Strategy 10: ChaCha20-Poly1305 (12-byte nonce, 16-byte tag; key must be 32 bytes)
+  defp try_aead_chacha20(tags, keys) do
+    hit = Enum.find_value(keys, fn key ->
+      key32 = if byte_size(key) == 16, do: key <> :binary.copy(<<0>>, 16), else: key
+      if byte_size(key32) != 32 do
+        nil
+      else
+        results = Enum.map(tags, fn tag ->
+          enc = encrypted_binary(tag)
+          enc_len = byte_size(enc)
+          if enc_len < 12 + 16 + 1 do
+            :skip
+          else
+            nonce = header_to_nonce(tag, 12)
+            ciphertext = binary_part(enc, 0, enc_len - 16)
+            tag_bin = binary_part(enc, enc_len - 16, 16)
+            case chacha20_decrypt(key32, nonce, ciphertext, <<>>, tag_bin) do
+              {:ok, _} -> :pass
+              _ -> :fail
+            end
+          end
+        end)
+        pass = Enum.count(results, &(&1 == :pass))
+        if pass >= max(1, div(length(tags), 2)) do
+          IO.puts("  !!! ChaCha20-Poly1305 HIT: pass=#{pass}/#{length(tags)}")
+          true
+        end
+      end
+    end)
+    unless hit, do: IO.puts("  No hits with ChaCha20-Poly1305")
+    hit
+  end
+
+  defp chacha20_decrypt(key, nonce, ciphertext, aad, tag) when byte_size(key) == 32 do
+    try do
+      case :crypto.crypto_one_time_aead(:chacha20_poly1305, key, nonce, ciphertext, aad, tag, false) do
+        :error -> :error
+        plaintext when is_binary(plaintext) -> {:ok, plaintext}
+      end
+    rescue
+      _ -> :error
+    catch
+      _, _ -> :error
+    end
   end
 
   defp ccm_decrypt(key, nonce, ciphertext, aad, mac) do
@@ -2216,7 +2683,39 @@ defmodule NfcDecrypt do
     end
   end
 
-  defp report_ccm_hit(key, nonce_len, mac_len, aad_name, strategy, pass, total, tags) do
+  # Full 5-byte cleartext header: block0 (4 bytes) + format byte 0x01
+  defp cleartext_header(tag) do
+    hex = Enum.at(tag["blocks"], 0) || "00000000"
+    block0 = Base.decode16!(String.pad_trailing(String.upcase(hex), 8, "0"), case: :mixed)
+    block0 <> <<0x01>>
+  end
+
+  # AAD options used across CCM strategies (name, fn tag -> aad_binary)
+  defp ccm_aad_options do
+    [
+      {"empty", fn _tag -> <<>> end},
+      {"header4", fn tag ->
+        hex = Enum.at(tag["blocks"], 0) || "00000000"
+        Base.decode16!(String.pad_trailing(String.upcase(hex), 8, "0"), case: :mixed)
+      end},
+      {"header5", fn tag -> cleartext_header(tag) end},
+      {"format_byte", fn _tag -> <<0x01>> end},
+      {"payload_len_x8", fn tag ->
+        hex = Enum.at(tag["blocks"], 0) || "00000000"
+        bin = Base.decode16!(String.pad_trailing(String.upcase(hex), 8, "0"), case: :mixed)
+        len_2 = if byte_size(bin) >= 2, do: binary_part(bin, 0, 2), else: <<0, 0>>
+        :binary.copy(len_2, 8)
+      end},
+      {"payload_len_x4", fn tag ->
+        hex = Enum.at(tag["blocks"], 0) || "00000000"
+        bin = Base.decode16!(String.pad_trailing(String.upcase(hex), 8, "0"), case: :mixed)
+        len_2 = if byte_size(bin) >= 2, do: binary_part(bin, 0, 2), else: <<0, 0>>
+        :binary.copy(len_2, 4)
+      end},
+    ]
+  end
+
+  defp report_ccm_hit(key, nonce_len, mac_len, aad_fn, aad_name, strategy, pass, total, tags) do
     key_hex = Base.encode16(key, case: :lower)
     IO.puts("\n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     IO.puts("  !!! AES-CCM HIT: #{strategy} !!!")
@@ -2231,12 +2730,18 @@ defmodule NfcDecrypt do
     Enum.each(tags, fn tag ->
       enc = encrypted_binary(tag)
       enc_len = byte_size(enc)
+      aad = aad_fn.(tag)
 
       {nonce, ciphertext, mac} = case strategy do
         "embedded_nonce" ->
           {binary_part(enc, 0, nonce_len),
            binary_part(enc, nonce_len, enc_len - nonce_len - mac_len),
            binary_part(enc, enc_len - mac_len, mac_len)}
+        "mac_at_start" ->
+          mac = binary_part(enc, 0, mac_len)
+          nonce = binary_part(enc, mac_len, nonce_len)
+          ct = binary_part(enc, mac_len + nonce_len, enc_len - mac_len - nonce_len)
+          {nonce, ct, mac}
         "uid_nonce" ->
           {uid_to_nonce(tag, nonce_len),
            binary_part(enc, 0, enc_len - mac_len),
@@ -2249,9 +2754,25 @@ defmodule NfcDecrypt do
           {:binary.copy(<<0>>, nonce_len),
            binary_part(enc, 0, enc_len - mac_len),
            binary_part(enc, enc_len - mac_len, mac_len)}
+        "hash_header" ->
+          {nonce_hash_header(tag, nonce_len),
+           binary_part(enc, 0, enc_len - mac_len),
+           binary_part(enc, enc_len - mac_len, mac_len)}
+        "hash_category" ->
+          {nonce_hash_category(tag, nonce_len),
+           binary_part(enc, 0, enc_len - mac_len),
+           binary_part(enc, enc_len - mac_len, mac_len)}
+        "payload_len_nonce" ->
+          {nonce_payload_len(tag, nonce_len),
+           binary_part(enc, 0, enc_len - mac_len),
+           binary_part(enc, enc_len - mac_len, mac_len)}
+        _ ->
+          {binary_part(enc, 0, nonce_len),
+           binary_part(enc, nonce_len, enc_len - nonce_len - mac_len),
+           binary_part(enc, enc_len - mac_len, mac_len)}
       end
 
-      case ccm_decrypt(key, nonce, ciphertext, <<>>, mac) do
+      case ccm_decrypt(key, nonce, ciphertext, aad, mac) do
         {:ok, plaintext} ->
           hex = plaintext |> binary_part(0, min(32, byte_size(plaintext)))
                 |> :binary.bin_to_list()
