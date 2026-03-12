@@ -8,12 +8,16 @@ defmodule NfcDecrypt do
     Byte  4:    0x01 (fixed)
     Byte  5+:   Encrypted blob (high entropy, ~6.4 bits/byte)
 
-  After ASIC decryption, the data becomes TLV:
+  Expected plaintext layout after decryption (from firmware / node-smartplay HARDWARE.md; not verified —
+  we have not broken the encryption). Used as validation targets for decryption attempts:
     byte[0:1]  Type ID (12-bit type + 2-bit block_type in bits 12-13)
     byte[2:3]  Content length (uint16 LE)
-    byte[4:7]  Event type magic:
-                 Identity tags: 0xA7E24ED1 (LE: D1 4E E2 A7)
-                 Item tags:     0x0BBDA113 (LE: 13 A1 BD 0B)
+    byte[4:7]  Event type magic (uint32 LE). All known values accepted for validation:
+                 Identity / alias / presence: 0xA7E24ED1 (LE: D1 4E E2 A7)
+                 Item (tile):                0x0BBDA113 (LE: 13 A1 BD 0B)
+                 Play command:               0x812312DC (LE: DC 12 23 81)
+                 Distributed play (PAwR):    0x814A0D84 (LE: 84 0D 4A 81)
+                 Status/position:            0xE3B77171 (LE: 71 71 B7 E3)
 
   Run with:
     mix run -e "NfcDecrypt.run()"
@@ -26,8 +30,21 @@ defmodule NfcDecrypt do
   import Bitwise
 
   @cleartext_header_size 5
-  @identity_event_magic <<0xD1, 0x4E, 0xE2, 0xA7>>
-  @item_event_magic <<0x13, 0xA1, 0xBD, 0x0B>>
+  # Event type magics at TLV offset 4 (uint32 LE). From firmware v2.29.1 / node-smartplay HARDWARE.md.
+  @identity_event_magic <<0xD1, 0x4E, 0xE2, 0xA7>>   # 0xA7E24ED1 Identity / alias / presence
+  @item_event_magic <<0x13, 0xA1, 0xBD, 0x0B>>       # 0x0BBDA113 Item (tile)
+  @play_cmd_magic <<0xDC, 0x12, 0x23, 0x81>>        # 0x812312DC Play command
+  @distributed_play_magic <<0x84, 0x0D, 0x4A, 0x81>> # 0x814A0D84 Distributed play (PAwR)
+  @status_position_magic <<0x71, 0x71, 0xB7, 0xE3>> # 0xE3B77171 Status/position event
+
+  @all_event_magics [
+    @identity_event_magic,
+    @item_event_magic,
+    @play_cmd_magic,
+    @distributed_play_magic,
+    @status_position_magic
+  ]
+
   @tea_delta 0x9E3779B9
   @mask32 0xFFFFFFFF
 
@@ -39,6 +56,56 @@ defmodule NfcDecrypt do
 
   defp drop_test_tags(tags) do
     Enum.reject(tags, &skip_test_tag?/1)
+  end
+
+  @doc """
+  Backfill missing "category" field in JSONL using name-based inference (identity/item/unknown).
+  Use when re-processing old dumps that don't have category set.
+
+  Usage:
+    mix run -e "NfcDecrypt.backfill_category_jsonl(\\\"data\\\")"
+    mix run -e "NfcDecrypt.backfill_category_jsonl(\\\"data/nfc_dump_2026-03-12.jsonl\\\")"
+  """
+  def backfill_category_jsonl(path_or_dir) do
+    paths =
+      if File.dir?(path_or_dir) do
+        Path.wildcard(Path.join(path_or_dir, "*.jsonl")) |> Enum.sort()
+      else
+        if File.exists?(path_or_dir), do: [path_or_dir], else: []
+      end
+
+    if paths == [] do
+      IO.puts("No JSONL file(s) found at #{path_or_dir}")
+      :ok
+    else
+      Enum.each(paths, &backfill_one_jsonl/1)
+    end
+  end
+
+  defp backfill_one_jsonl(path) do
+    lines =
+      path
+      |> File.stream!()
+      |> Stream.map(&String.trim/1)
+      |> Stream.reject(&(&1 == ""))
+      |> Enum.map(fn line ->
+        case JSON.decode(line) do
+          {:ok, tag} when is_map(tag) ->
+            tag =
+              if Map.has_key?(tag, "category") and tag["category"] != nil and tag["category"] != "" do
+                tag
+              else
+                cat = tag_category_from_item(tag)
+                Map.put(tag, "category", Atom.to_string(cat))
+              end
+            JSON.encode!(tag)
+          _ ->
+            line
+        end
+      end)
+
+    File.write!(path, Enum.join(lines, "\n") <> "\n")
+    IO.puts("Backfilled category in #{path} (#{length(lines)} lines)")
   end
 
   def run(jsonl_path \\ nil, opts \\ []) do
@@ -94,9 +161,13 @@ defmodule NfcDecrypt do
     IO.puts("\n=== TLV variants (content_len × block_type) ===")
     Enum.each(unique, &try_tlv_variants/1)
 
-    # (2) AES-ECB with candidate keys
-    IO.puts("\n=== AES-128-ECB with candidate keys ===")
-    Enum.each(unique, &try_aes_ecb/1)
+    # (2) AES-CCM with candidate keys (firmware uses CCM, not ECB)
+    if length(unique) >= 1 do
+      keys = load_all_candidate_keys() ++ tag_derived_candidate_keys(unique)
+      IO.puts("\n=== AES-128-CCM with candidate keys (#{length(keys)} keys, embedded-nonce then header-nonce) ===")
+      hit = try_ccm_embedded_nonce(unique, keys)
+      if !hit, do: try_ccm_header_nonce(unique, keys)
+    end
 
     # (2b) AES-CCM brute-force with random keys (payload is CCM, not ECB; same option name for compatibility)
     num_rand = opts[:aes_bruteforce_tries] || 100_000
@@ -279,6 +350,25 @@ defmodule NfcDecrypt do
   end
 
   defp tag_category(tag) do
+    case Map.get(tag, "category") |> normalize_category_field() do
+      nil -> tag_category_from_item(tag)
+      cat -> cat
+    end
+  end
+
+  defp normalize_category_field(nil), do: nil
+  defp normalize_category_field(""), do: nil
+  defp normalize_category_field(s) when is_binary(s) do
+    case String.downcase(String.trim(s)) do
+      "identity" -> :identity
+      "item" -> :item
+      "unknown" -> :unknown
+      _ -> nil
+    end
+  end
+
+  # Fallback for JSONL without "category": infer from "item" label (legacy / backfill).
+  defp tag_category_from_item(tag) do
     item = (Map.get(tag, "item", "") || "") |> String.downcase()
     cond do
       String.contains?(item, "(identity") -> :identity
@@ -470,59 +560,8 @@ defmodule NfcDecrypt do
     end
   end
 
-  defp try_aes_ecb(tag) do
-    payload = payload_binary(tag)
-    item = Map.get(tag, "item", tag["uid"])
-    if byte_size(payload) < 16 do
-      IO.puts("  #{item}: skip (payload < 16)")
-    else
-      block0 = binary_part(payload, 0, 16)
-      candidates = [
-        pad16("LEGO"),
-        pad16("EM"),
-        pad16("SmartTag"),
-        pad16("DA000001"),
-        :binary.copy(<<0>>, 16),
-        :binary.copy(<<1>>, 16),
-        pad16("P11_audiobrick"),
-        pad16("LtcaxE")
-      ] |> Enum.uniq()
-
-      results =
-        for key <- candidates do
-          try do
-            dec = :crypto.crypto_one_time(:aes_128_ecb, key, block0, false)
-            dec_list = :binary.bin_to_list(dec)
-            {type_ok, len_ok, next_len} = score_tlv_next(dec_list ++ List.duplicate(0, 8), 300)
-            ratio = printable_or_zero_ratio(dec_list)
-            key_name = key |> trim_null() |> inspect()
-            {key_name, dec_list, type_ok, len_ok, next_len, ratio}
-          rescue
-            _ -> nil
-          end
-        end
-        |> Enum.reject(&is_nil/1)
-
-      IO.puts("  #{item}: tried #{length(candidates)} keys")
-      hits = Enum.filter(results, fn {_, _, to, lo, _, _} -> to and lo end)
-      if hits != [] do
-        for {kname, dec, to, lo, nl, _} <- hits do
-          hex = dec |> Enum.take(8) |> Enum.map(fn b -> Integer.to_string(b, 16) |> String.pad_leading(2, "0") end) |> Enum.join(" ")
-          IO.puts("    >>> key=#{kname} type_ok=#{to} len_ok=#{lo} next_len=#{nl}  first8=#{hex}")
-        end
-      else
-        best = Enum.max_by(results, fn {_, _, _, _, _, r} -> r end, fn -> {nil, [], false, false, 0, 0.0} end)
-        if elem(best, 5) > 0.3 do
-          {kname, dec, _, _, nl, ratio} = best
-          hex = dec |> Enum.take(8) |> Enum.map(fn b -> Integer.to_string(b, 16) |> String.pad_leading(2, "0") end) |> Enum.join(" ")
-          IO.puts("    best key=#{kname} ratio=#{Float.round(ratio, 3)} next_len=#{nl}  first8=#{hex}")
-        end
-      end
-    end
-  end
-
   # For a key, decrypt first 16 bytes of each payload; return {count where type_ok+len_ok, total_with_16_bytes}.
-  # (Used by try_aes_ecb_bruteforce_strings and by try_aes_ecb candidate-key validation.)
+  # (Used by try_aes_ecb_bruteforce_strings for cross-tag validation.)
   defp validate_aes_key_on_payloads(key, all_payloads) do
     result =
       Enum.reduce(all_payloads, 0, fn pl, acc ->
@@ -722,7 +761,7 @@ defmodule NfcDecrypt do
     magic_ok = if expected do
       magic_bytes == expected
     else
-      magic_bytes == @identity_event_magic or magic_bytes == @item_event_magic
+      magic_bytes in @all_event_magics
     end
 
     pass = block_type_ok and upper_ok and len_ok and magic_ok
@@ -999,11 +1038,7 @@ defmodule NfcDecrypt do
     tlv_pts = if (type_hi &&& 0xC0) == 0 and content_len > 0 and content_len <= enc_len, do: 15, else: 0
 
     magic = Enum.slice(dec_bytes, 4, 4) |> IO.iodata_to_binary()
-    magic_pts = cond do
-      magic == @identity_event_magic -> 50
-      magic == @item_event_magic -> 50
-      true -> 0
-    end
+    magic_pts = if magic in @all_event_magics, do: 50, else: 0
 
     crc_pts = check_crc32_presence(dec_bytes)
 

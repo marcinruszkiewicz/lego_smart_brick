@@ -36,7 +36,7 @@ Show Arduino debug lines (`[D] ...` / `[DEBUG] ...`) in the capture output (usef
 mix run -e "NfcCapture.run(debug: true)"
 ```
 
-Output is written to `nfc_dump_YYYY-MM-DD.jsonl` in the `../data` directory. Each line is one JSON object: `uid`, `afi`, `dsfid`, `blocks`.
+Output is written to `nfc_dump_YYYY-MM-DD.jsonl` in the `../data` directory. Each line is one JSON object: `uid`, `afi`, `dsfid`, `blocks`, `item`, `category` (identity/item/unknown). For older JSONL files missing `category`, run a backfill from the decrypt module: `mix run -e "NfcDecrypt.backfill_category_jsonl(\"../data\")"`.
 
 Press **Ctrl+C** to stop.
 
