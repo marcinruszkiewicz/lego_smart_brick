@@ -12,7 +12,7 @@ The original factory tags are permanently write-locked, but blank writable tags 
 
 ### UID and chip vendor independence
 
-The smart brick identifies tags by the **stored block data** (encrypted payload), not by the UID. Cloning the same tag dump onto multiple blank stickers with different UIDs produces identical behaviour on the brick. Verified with Tie Fighter clones on blanks with UIDs `E0040150B81E7E2E` and `E0040150B81E7EA6` — both behave the same as the original LEGO tag (UID prefix `E016`, EM4233). Blanks from other chip vendors (e.g. UID prefix `E004`) work as long as they are ISO 15693 writable; the brick does not require the same IC as the originals.
+The smart brick identifies tags by the **stored block data** (encrypted payload), not by the UID. Cloning the same tag dump onto multiple blank stickers with different UIDs produces identical behaviour on the brick. Verified with Tie Fighter clones on blanks with UIDs `E0040150B81E7E2E` and `E0040150B81E7EA6` — both behave the same as the original LEGO tag (UID prefix `E016`, EM4233). Identity tags work the same way: an Emperor Palpatine dump cloned onto a new sticker (UID `E0040109049DE218`) has been verified working on the brick. Blanks from other chip vendors (e.g. UID prefix `E004`) work as long as they are ISO 15693 writable; the brick does not require the same IC as the originals.
 
 ## Compatible blank tags
 
@@ -30,7 +30,7 @@ Look for "ISO 15693 NFC sticker" or "ICODE SLIX sticker" or "NFC Type 5 sticker"
 
 ## Available tags to clone
 
-All saved tag dumps in `data/` are available. The clone tool loads every `.jsonl` file, deduplicates by payload, and shows a single menu entry per unique tag. As of the latest captures:
+All saved tag dumps in `data/` are available. The clone tool loads every `.jsonl` file, deduplicates by payload, and shows a single menu entry per unique tag. The file `data/nfc_dump_2026-03-16.jsonl` contains verified clones (e.g. Palpatine sticker clone) written to new stickers and confirmed working. As of the latest captures:
 
 | # | Item | Type | Data blocks | Payload bytes |
 |---|------|------|-------------|---------------|
