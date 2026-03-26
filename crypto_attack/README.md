@@ -1,16 +1,49 @@
 # Grain-128A Key Recovery Attack
 
-Prototype implementation of a guess-and-determine attack on Grain-128A (ISO/IEC 29167-13) using 320 bits of known keystream from LEGO smart brick NFC tags.
+Optimized key search for Grain-128A (ISO/IEC 29167-13) using known keystream constraints from LEGO smart brick NFC tags. Bitsliced implementation processes 64 candidates per clock cycle across all CPU cores.
 
-## Background
+## Constraints
 
-We have:
-- **4 ship tags** (X-Wing, TIE Fighter, Millennium Falcon, A-Wing) with identical 90-byte plaintext structure
-- **10 known plaintext bytes** at offsets 53-69 per tag (from firmware dispatch chain tracing)
-- **40 known keystream bytes** total (10 per tag × 4 tags) = **320 bits of constraint** on the 128-bit key
-- **Per-tag IVs** extracted from bytes 5-16 of each tag payload
+We derive known keystream bytes from **structural constants** in the tag plaintext — sub-record headers (timer, button) whose values are fixed by the TLV format regardless of tag content. Combined with known ciphertext from tag dumps, this gives `keystream[i] = ciphertext[i] XOR plaintext[i]`.
 
-The key is uniquely determined by these constraints (320 bits > 128 bits). The challenge is *inverting* Grain-128A's 256 nonlinear initialization rounds to go from keystream to key.
+| Source | Tags | Known bytes/tag | Total bytes | Total bits |
+| --- | --- | --- | --- | --- |
+| Ship tags (X-Wing, TIE, Falcon) | 3 | 10 | 30 | 240 |
+| Identity tags (Luke, Vader, Leia, Palpatine, Han Solo) | 5 | 9 | 45 | 360 |
+| Item tags (Fuel Cargo) | 1 | 7 | 7 | 56 |
+| **Total** | **9** | | **82** | **656** |
+
+656 bits of constraint on a 128-bit key — over-determined by 5x. Each tag uses a different IV, providing independent keystream equations.
+
+Generate the constraints file from tag dumps:
+
+```bash
+cd ../mac_capture && mix run -e "GrainExperiments.export_constraints_c()"
+```
+
+## Performance (Mac Mini M4)
+
+Three layers of parallelism:
+
+| Layer | Technique | Speedup |
+| --- | --- | --- |
+| Bitslicing | 64 candidates per clock cycle via `uint64_t` words | ~70x |
+| Multi-threading | pthreads across all CPU cores | ~10x (10 cores) |
+| Early exit | Bail when `survivors == 0` after first constraint byte | ~1.2x |
+
+| Configuration | Keys/sec |
+| --- | --- |
+| Scalar, single-core (baseline) | 240K |
+| Bitsliced, single-core | 15.6M |
+| Bitsliced, 10 threads, 9 constraints | **50M** |
+
+| Keyspace | Time on M4 |
+| --- | --- |
+| 2^32 | ~2 minutes |
+| 2^40 | ~8 hours |
+| 2^48 | ~6 days |
+| 2^56 | ~14 years |
+| 2^64 | ~3750 years |
 
 ## Attack landscape
 
@@ -41,53 +74,71 @@ ISO 29167-13 Grain-128A does **not** reintroduce the key during initialization (
 - Known keystream → known pre-output bits → system of equations on internal state
 - Each keystream bit gives one equation involving LFSR and NFSR bits
 
-## Our approach: guess-and-determine
+## Approach: guess-and-determine
 
 ### Strategy
 
 1. **After initialization**, the internal state is (NFSR[128], LFSR[128]) = 256 bits
 2. **Each keystream bit** provides one equation: `z_t = h(NFSR, LFSR) XOR lfsr[93] XOR nfsr[2] XOR nfsr[15] XOR nfsr[36] XOR nfsr[45] XOR nfsr[64] XOR nfsr[73] XOR nfsr[89]`
 3. **Guess a portion of the state** (e.g. LFSR[0..63]), then solve for the remainder using the keystream equations and feedback structure
-4. **Verify** against the 320-bit constraint — wrong guesses are rejected immediately
-
-### Complexity estimate
-
-- Guessing 64 LFSR bits: 2^64 candidates
-- For each guess: ~100 operations to propagate and check against keystream
-- Total: ~2^64 × 100 ≈ 2^71 operations
-- At 10^9 ops/sec (single core): ~74 years
-- At 10^12 ops/sec (GPU cluster): ~27 days
-- At 10^13 ops/sec (large GPU cluster): ~2.7 days
+4. **Verify** against the 656-bit constraint — wrong guesses are rejected immediately
 
 ### Reducing the guess space
 
 The `h` function involves specific LFSR and NFSR taps. By choosing which bits to guess strategically:
 - Guess LFSR bits that appear in `h` and feedback: positions 8, 13, 20, 42, 60, 79, 93, 94, 0, 7, 38, 70, 81, 96
 - Each known keystream bit adds one constraint, reducing effective search
-- With 320 constraint bits and careful algebraic reduction, the effective search space may be significantly below 2^64
+- With 656 constraint bits and 9 independent IVs, algebraic reduction may bring the effective search space significantly below 2^64
 
 ## Files
 
 | File | Description |
 | --- | --- |
-| `grain128a.c` | Optimized C implementation of Grain-128A with keystream verification |
-| `grain128a.h` | Header with state structures and API |
-| `attack.c` | Guess-and-determine attack main loop |
-| `Makefile` | Build with `make` (requires GCC or Clang) |
-| `README.md` | This file |
+| `grain128a.c` / `.h` | Scalar Grain-128A implementation (used for self-test and key-file mode) |
+| `grain128a_bs.c` / `.h` | Bitsliced Grain-128A — 64 candidates per clock cycle, circular-buffer shift registers |
+| `attack.c` | Multi-threaded search driver with sparse constraint loading and progress reporting |
+| `constraints.txt` | Sparse keystream constraints (generated by `GrainExperiments.export_constraints_c()`) |
+| `Makefile` | Build with `make` (requires Clang or GCC with pthreads) |
 
 ## Building and running
 
 ```bash
 make
-./grain_attack --verify    # Verify cipher against known test vectors
-./grain_attack --benchmark # Benchmark keystream generation speed
-./grain_attack --search    # Run guess-and-determine search (long!)
+./grain_attack --verify                        # Scalar + bitsliced self-test
+./grain_attack --verify --benchmark            # Throughput comparison
+./grain_attack --constraints constraints.txt --search 100000000  # Search 100M keys
+./grain_attack --constraints constraints.txt --search 100000000 --threads 4  # Limit threads
+./grain_attack --constraints constraints.txt --keys candidates.txt  # Test key file
 ```
 
-## CUDA extension (future)
+## Constraint file format
 
-The inner loop is embarrassingly parallel — each LFSR guess is independent. A CUDA kernel can test ~10^12 candidates/sec on a modern GPU. The `attack.c` code is structured to be easily ported to CUDA:
-- `test_lfsr_guess()` is a pure function with no side effects
-- State is 256 bits (fits in registers)
-- The verification check provides early rejection (first keystream byte mismatch → skip)
+Sparse format — one tag per line, comment lines start with `#`:
+
+```
+# Tag name
+IV_HEX offset1:ks_byte1 offset2:ks_byte2 ...
+```
+
+Example:
+
+```
+# X-Wing Tile (Item)
+24D43E829F371F47AB8F3636 53:07 54:00 55:02 59:51 60:CD 63:AC 64:D3 66:D4 67:92 69:8E
+```
+
+IV is 24 hex characters (12 bytes). Each `offset:byte` pair specifies a known keystream byte at that plaintext offset. Only listed positions are checked — no zero-fill.
+
+## Future directions
+
+### Metal GPU compute (macOS)
+
+The bitsliced inner loop is pure arithmetic on `uint64_t` arrays with no branching — ideal for GPU. A Metal compute shader could process thousands of batches in parallel, potentially 10-50x over CPU. The M4's unified memory means no host↔device copy overhead.
+
+### Algebraic reduction
+
+With 656 bits of constraint across 9 independent IVs, algebraic techniques (Gröbner basis, linearization) may find structure that reduces the effective search space below 2^64. Each IV provides an independent system of nonlinear equations over the same 128-bit key, massively constraining the solution.
+
+### Extending constraints
+
+Tags with "~close" model matches (Chewbacca, C-3PO, Lightsaber, Hyperdrive) may yield additional known bytes once the variable-length identity encoding is understood. The ~close matches differ by 2-5 bytes from the validated model — likely due to variable identity block sizes. If the extra bytes are appended after the button_ref, the timer/button structural bytes remain at predicted offsets.

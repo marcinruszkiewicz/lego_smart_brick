@@ -271,7 +271,9 @@ static void usage(const char *prog) {
         "  --verify              Run cipher self-test (scalar + bitsliced)\n"
         "  --benchmark           Benchmark scalar vs bitsliced throughput\n"
         "  --constraints <file>  Load sparse keystream constraints\n"
-        "  --search [count]      Multi-threaded search (default 100M)\n"
+        "  --search              Multi-threaded search\n"
+        "  --count <N>           Keys to search (default 100M, supports 1e9 notation)\n"
+        "  --start <N>           Start offset for search (default 0)\n"
         "  --threads <N>         Number of threads (default: all CPUs)\n"
         "  --keys <file>         Test hex keys from file\n"
         "  --help                Show this message\n",
@@ -283,7 +285,9 @@ int main(int argc, char *argv[]) {
         {"verify",      no_argument,       NULL, 'v'},
         {"benchmark",   no_argument,       NULL, 'b'},
         {"constraints", required_argument, NULL, 'c'},
-        {"search",      optional_argument, NULL, 's'},
+        {"search",      no_argument,       NULL, 's'},
+        {"count",       required_argument, NULL, 'n'},
+        {"start",       required_argument, NULL, 'S'},
         {"threads",     required_argument, NULL, 't'},
         {"keys",        required_argument, NULL, 'k'},
         {"help",        no_argument,       NULL, 'h'},
@@ -292,24 +296,29 @@ int main(int argc, char *argv[]) {
 
     int do_verify = 0, do_bench = 0, do_search = 0;
     uint64_t search_count = 100000000ULL;
+    uint64_t search_start = 0;
     int nthreads = get_ncpus();
     const char *constraint_file = NULL;
     const char *key_file = NULL;
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vbc:s::t:k:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vbc:sn:S:t:k:h", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'v': do_verify = 1; break;
             case 'b': do_bench = 1; break;
             case 'c': constraint_file = optarg; break;
-            case 's':
-                do_search = 1;
-                if (optarg) search_count = strtoull(optarg, NULL, 0);
-                break;
+            case 's': do_search = 1; break;
+            case 'n': search_count = (uint64_t)strtod(optarg, NULL); break;
+            case 'S': search_start = (uint64_t)strtod(optarg, NULL); break;
             case 't': nthreads = atoi(optarg); break;
             case 'k': key_file = optarg; break;
             case 'h': default: usage(argv[0]); return opt == 'h' ? 0 : 1;
         }
+    }
+
+    /* Treat remaining positional args as count (for convenience: --search 2e11) */
+    if (optind < argc && do_search) {
+        search_count = (uint64_t)strtod(argv[optind], NULL);
     }
 
     if (argc == 1) { usage(argv[0]); return 0; }
@@ -334,7 +343,7 @@ int main(int argc, char *argv[]) {
 
     if (key_file) try_key_file(key_file);
 
-    if (do_search) search(0, search_count, nthreads);
+    if (do_search) search(search_start, search_count, nthreads);
 
     return 0;
 }
