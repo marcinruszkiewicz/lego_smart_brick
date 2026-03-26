@@ -2,7 +2,9 @@
 
 ## Overview
 
-LEGO smart brick NFC tags store encrypted data payloads using **AES-128-CCM** (Counter with CBC-MAC). This document consolidates all findings from firmware disassembly, tag data analysis, and decryption attempts.
+LEGO smart brick NFC tags store encrypted data payloads using - most likely at the point of the writing - **Grain-128A** (ISO/IEC 29167-13), a lightweight stream cipher with a 128-bit key and 96-bit IV. The encryption and decryption are handled entirely by the **DA000001-01 ASIC** — the EM9305 BLE SoC never sees encrypted tag data.
+
+> **Note on AES-CCM:** Earlier versions of this document attributed the tag encryption to AES-128-CCM based on firmware log strings (`AES-CCM context create failed`, `AES_CCM_DecryptAndMAC failed`, etc.). Per [node-smartplay HARDWARE.md](https://github.com/nathankellenicki/node-smartplay/blob/main/notes/HARDWARE.md), the AES-CCM functions in the EM9305 firmware are for **BrickNet PAwR session encryption** and **EM9305↔ASIC mutual authentication**, not tag data decryption. The EM9305 never sees encrypted tag data — the ASIC reads, decrypts, and deposits structured TLV plaintext into EM9305 registers over SPI.
 
 ## Tag data layout
 
@@ -10,102 +12,129 @@ LEGO smart brick NFC tags store encrypted data payloads using **AES-128-CCM** (C
 Byte 0-1:  Payload length (big-endian, e.g. 0x00A9 = 169 bytes)
 Byte 2-3:  0x01 0x0C (fixed tag capacity = 268 bytes)
 Byte 4:    0x01 (security format version)
-Byte 5+:   AES-CCM encrypted blob
+Byte 5-16: Per-content IV (96 bits / 12 bytes) — unique per tag content type
+Byte 17+:  Grain-128A ciphertext (keystream XOR plaintext)
 ```
 
-The encrypted region starts at byte 5. Everything before that is cleartext header.
+The encrypted region starts at byte 5. The first 12 bytes of the encrypted region are the per-content IV used to initialize the Grain-128A cipher. The remaining bytes are ciphertext. There may be a MAC (0-8 bytes) at the end of the payload.
 
 ## What we know about the encryption
 
-### Algorithm: AES-128-CCM
+### Algorithm: Grain-128A (ISO/IEC 29167-13) is a good guess
 
-Confirmed by firmware log strings:
+**Evidence:**
 
-- `AES-CCM context create failed Result={}`
-- `AES_CCM_DecryptAndMAC failed Result={}`
-- `AES_CCM_GetMAC failed Result={}`
-- `AES_CCM MAC verification failed`
-- `Tag security verification passed`
+1. Tag IC reference **0x17** matches EM Microelectronic's **EM4237**, which implements Grain-128A
+2. Tag memory layout (66 blocks × 4 bytes) matches EM4237
+3. Payload sizes (69–166 bytes of encrypted data) are **not multiples of any block cipher block size** — consistent with a stream cipher
+4. EM Microelectronic uses Grain-128A across their ISO 15693 product line (EM4237, EM4333)
+5. Grain-128A is a lightweight LFSR+NFSR stream cipher feasible for a small mixed-signal ASIC
 
-### Key size: 16 bytes (AES-128)
+### Key size: 128 bits (16 bytes)
 
-Confirmed by disassembly of the crypto init function at `0x03CA00`:
+Standard Grain-128A parameter. The key initializes the 128-bit NFSR (Nonlinear Feedback Shift Register).
 
-```
-mov_s r3, 0x10    ; r3 = 16 = AES-128 key size
-```
+### IV size: 96 bits (12 bytes)
 
-### Key location: hardware register 0x808904
+Standard Grain-128A parameter. The IV initializes the 128-bit LFSR as: `IV(96 bits) || ones(31 bits) || 0`. Each tag content type has a unique IV embedded in the encrypted region at bytes 5-16.
 
-The key is **not stored in the firmware binary**. It lives in a hardware key register on the MCU (likely EM9305 OTP/key slot memory). The crypto init function reads 16 bytes from `0x808904` into the AES engine at `0x80884c`.
+### Key location: DA000001-01 ASIC silicon
 
-This means the key cannot be extracted by analyzing firmware update files alone.
+The Grain-128A decryption key is **not in the EM9305 firmware or its registers**. It resides in the DA000001-01 custom LEGO ASIC. All bricks share the same decryption capability (any brick decrypts any tag), so the key is global — likely a silicon constant or OTP value in the ASIC.
 
-### Nonce is NOT derived from UID
+**What about register 0x808904?** The AES hardware at `0x808800`–`0x8089FF` and the key at `0x808904` on the EM9305 are used for BrickNet PAwR encryption and EM9305↔ASIC mutual authentication. They are not involved in tag decryption.
+
+### Nonce/IV is NOT derived from UID
 
 Two different Vader minifigure tags with different UIDs (`E0165C011FC66027` and `E0165C011FC88E45`) contain **byte-identical encrypted payloads**. This proves:
 
 1. The encryption key is the same across tags (global, not per-tag).
-2. The nonce/IV is the same for the same plaintext (likely deterministic from the data, not from UID).
+2. The IV is the same for the same content (embedded in the payload, not from UID).
 3. All tags of the same "type" encrypt to the same ciphertext.
+4. Different clones to the same UID copy still work
 
-### Known AES-CCM parameters (partial)
+### Per-content IV confirmed by XOR analysis
+
+Exhaustive pairwise XOR analysis across 14 unique tag dumps (91 pairs) found no shared keystream at any ciphertext offset — ruling out a static nonce. Each tag has a unique 12-byte IV at bytes 5-16, different for each content type but identical across physical copies of the same content.
+
+### Known parameters
 
 
-| Parameter    | Value                                             | Source                         |
-| ------------ | ------------------------------------------------- | ------------------------------ |
-| Algorithm    | AES-CCM                                           | Firmware strings               |
-| Key size     | 16 bytes                                          | Disassembly (`mov_s r3, 0x10`) |
-| Key storage  | HW register 0x808904                              | Disassembly trace              |
-| Nonce length | Unknown (7-13 bytes per CCM spec)                 | —                              |
-| MAC length   | Unknown (4, 8, or 16 bytes)                       | —                              |
-| AAD          | Unknown (possibly empty, header, or tag metadata) | —                              |
+| Parameter   | Value                                             | Source                                |
+| ----------- | ------------------------------------------------- | ------------------------------------- |
+| Algorithm   | Grain-128A (ISO/IEC 29167-13)                     | IC ref 0x17 = EM4237                  |
+| Key size    | 128 bits (16 bytes)                               | Grain-128A standard                   |
+| IV size     | 96 bits (12 bytes)                                | Grain-128A standard                   |
+| IV location | Bytes 5-16 of tag payload                         | XOR analysis + per-content uniqueness |
+| Key storage | DA000001-01 ASIC silicon                          | ASIC handles all tag decryption       |
+| MAC length  | Unknown (0-4 bytes, Grain-128A supports 0-32 bit) | —                                     |
 
 
 ### Decrypted data structure (TLV)
 
-After decryption, the plaintext is **expected** to be TLV-structured. This has not been verified by successfully decrypting a tag (the key is in hardware and we do not have it):
+After decryption, the plaintext is TLV-structured. From [node-smartplay FLOW.md](https://github.com/nathankellenicki/node-smartplay/blob/main/notes/FLOW.md), the ASIC deposits a **type 0x22 TLV container** with sub-records into EM9305 registers:
 
-```
-Bytes 0-1:  Type ID (12-bit type + 2-bit block_type in bits 12-13)
-Bytes 2-3:  Content length (uint16 LE)
-Bytes 4-7:  Event type magic (uint32 LE). All known values accepted for decryption validation:
-              Identity / alias / presence: 0xA7E24ED1 (LE: D1 4E E2 A7)
-              Item (tile):                0x0BBDA113 (LE: 13 A1 BD 0B)
-              Play command:               0x812312DC (LE: DC 12 23 81)
-              Distributed play (PAwR):    0x814A0D84 (LE: 84 0D 4A 81)
-              Status/position:            0xE3B77171 (LE: 71 71 B7 E3)
-```
+- Sub-record format: `[type:1][param:1][length:1][payload:N]`
+- Content identity record: 7 bytes `{content_lo(u32), content_hi(u16), type_byte(u8)}`
+- Resource reference records: `{content_ref_start(u16), content_ref_end(u16), bank_index(u16), bank_ref(u16)}`
 
-**Confirmed from firmware:** In fw_v1.119.0, the callee **0xfe14** (reached from tag data processing 0x25718) loads a halfword at offset 0, a halfword at offset 2, and a word at offset 4 from the decrypted buffer, and compares the value at 4 — matching the expected TLV layout (type_id @ 0, content_len @ 2, event magic @ 4). See [firmware/ANALYZE_TAG_TLV.md](../firmware/ANALYZE_TAG_TLV.md) 
-
-The **magic constants** 0xA7E24ED1 / 0x0BBDA113 have **not** been found in code.bin, rofs_files/play, or as immediates in the disassembly; run `firmware/find_magic_constants.py fw_v1.119.0` to reproduce the search. They may be in another ROFS file, computed from type_id, or in a literal pool; see [firmware/ANALYZE_TAG_TLV.md](../firmware/ANALYZE_TAG_TLV.md) §8.
-
-**Provenance:** The numeric values (and the full event-type table) are taken from [node-smartplay HARDWARE.md](https://github.com/nathankellenicki/node-smartplay/blob/main/notes/HARDWARE.md#tag-content-data), which attributes them to firmware debug strings (v0.46–v0.54) and disassembly of v0.72.1. The firmware we analyze (build label fw_v1.119.0) has **ROFS content version 0.46.0** (from `rofs_files/version`), i.e. the same generation HARDWARE.md cites — yet the magic constants do not appear as 4-byte literals in code.bin or play. So they may have been inferred from behaviour/disassembly, or appear only in a different build or encoding. 
-
-## Firmware architecture
-
-- **MCU:** ARC EM architecture (likely EM9305)
-- **Firmware format:** `~P11` signed containers
-- **AES engine:** Hardware-accelerated, memory-mapped at `0x808800`–`0x8089FF`
-- **No AES S-box** in the binary (confirming hardware acceleration)
-- **Flash base address:** `0x306000`
-
-### Key crypto functions
+The event type magics (confirmed in fw v2.29.1 disassembly as immediates at function 0x66c74):
 
 
-| Address  | Role                                                 |
-| -------- | ---------------------------------------------------- |
-| 0x03CA00 | Crypto init — loads AES key from HW register         |
-| 0x03C984 | Tag slot config — initializes 4 slot types (R/S/T/U) |
-| 0x025718 | Tag data processing — most complex crypto function   |
-| 0x025C50 | Error handler for AES-CCM failures                   |
-| 0x03E67C | Tag reader function                                  |
+| Event type              | Magic (LE) | Hex bytes   |
+| ----------------------- | ---------- | ----------- |
+| Identity / alias        | 0xA7E24ED1 | D1 4E E2 A7 |
+| Item (tile)             | 0x0BBDA113 | 13 A1 BD 0B |
+| Play command            | 0x812312DC | DC 12 23 81 |
+| Distributed play (PAwR) | 0x814A0D84 | 84 0D 4A 81 |
+| Status/position         | 0xE3B77171 | 71 71 B7 E3 |
 
 
-### Tag slot types
+### Known plaintext and keystream (from node-smartplay)
 
-The firmware manages 4 tag slot types: R (0x52), S (0x53), T (0x54), U (0x55) — likely Read, Security/Sign, Tag, Update/User.
+For the 4 ship tags (X-Wing, TIE, Falcon, A-Wing — all 90-byte plaintext), **10 firm known plaintext bytes** at offsets 53-69 have been identified from firmware dispatch chain tracing. Combined with 4 tags, this gives **320 bits of keystream constraint** on the 128-bit key (massively over-determined).
+
+The known keystream bytes have been verified against our tag dumps — all 30 checks pass (3 of 4 ship tags in our data). See `mac_capture/lib/grain_experiments.ex` for the verification code.
+
+## Architecture
+
+### Two-chip system
+
+
+| Chip                 | Role in tag processing                                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **DA000001-01 ASIC** | Reads tags via NFC coils, decrypts Grain-128A payload internally, deposits structured TLV into EM9305 registers over SPI |
+| **EM9305 BLE SoC**   | Receives decrypted TLV data, runs play engine, handles BLE. AES-CCM used for BrickNet PAwR and ASIC mutual auth only     |
+
+
+The EM9305 firmware never constructs ISO 15693 commands, never sees encrypted tag data, and never touches the Grain-128A decryption key. All tag crypto is in the ASIC.
+
+### EM9305 AES-CCM (BrickNet, not tags)
+
+The AES-CCM functions found in EM9305 firmware are for:
+
+1. **BrickNet PAwR session encryption** — encrypted communication between bricks
+2. **EM9305↔ASIC mutual authentication** — during ASIC init, the EM9305 copies a 16-byte key from config struct `0x80DCE4+0x26` to ASIC register `0xF04084`
+
+Firmware log strings that were previously attributed to tag decryption:
+
+- `AES-CCM context create failed Result={}` — BrickNet/ASIC-auth
+- `AES_CCM_DecryptAndMAC failed Result={}` — BrickNet/ASIC-auth
+- `AES_CCM_GetMAC failed Result={}` — BrickNet/ASIC-auth
+- `AES_CCM MAC verification failed` — BrickNet/ASIC-auth
+- `Tag security verification passed` — post-ASIC validation (firmware side, after ASIC decryption)
+
+### Key crypto functions (EM9305 — BrickNet/ASIC-auth, NOT tag decryption)
+
+
+| Address  | Role                                                                  |
+| -------- | --------------------------------------------------------------------- |
+| 0x03CA00 | Crypto init — loads AES key from HW register (for BrickNet/ASIC-auth) |
+| 0x03C984 | Tag slot config — initializes 4 slot types (R/S/T/U)                  |
+| 0x025718 | Tag data processing — processes decrypted TLV from ASIC               |
+| 0x025C50 | Error handler for AES-CCM failures (BrickNet)                         |
+| 0x03E67C | Tag reader function                                                   |
+
 
 Full disassembly trace details: [firmware/DISASM_TRACE_FINDINGS.md](../firmware/DISASM_TRACE_FINDINGS.md).
 
@@ -121,41 +150,53 @@ LEGO's backend platform "Bilbo" manages smart brick devices. Probed endpoints:
 | `rango.bilbo.lego.com/...`  | 404/405 | Element/tag services, needs `x-api-key` |
 
 
-The Enigma service has endpoints like `CreateSpkitBundle` and `SharedKey` that may be involved in key provisioning. Access requires authentication.
+The Enigma service has endpoints like `CreateSpkitBundle` and `SharedKey` that may be involved in key provisioning for BrickNet or ASIC authentication. Access requires authentication.
 
 ## Decryption attempts so far
 
-### Firmware key extraction (`firmware/extract_keys.py`)
+### Grain-128A keystream verification (`mac_capture/lib/grain_experiments.ex`)
 
-Extracted ~1,100 candidate 16-byte keys from firmware binaries using entropy filtering and alignment heuristics. None produced valid AES-CCM decryptions — consistent with the key being in hardware, not firmware.
+- Correct IV extraction from bytes 5-16 of each tag
+- Known plaintext keystream constraints verified against 3 ship tags (30/30 checks pass)
+- Key candidate search with ~50 derived keys — no match (key is in ASIC silicon)
 
-### AES-CCM brute force (`mac_capture/lib/nfc_decrypt.ex`)
+### Prior AES-CCM attempts (now known to target wrong cipher)
 
-Tried all candidate keys with multiple parameter combinations:
+These targeted AES-CCM, which is used for BrickNet, not tags:
 
-- Nonce lengths: 7, 8, 10, 11, 12, 13 bytes
-- MAC lengths: 4, 8, 16 bytes
-- Nonce derivation: embedded in data, header-derived, fixed zeros
-- Result: no valid decryptions (authentication tag mismatch on all attempts)
+- ~1,100 candidate 16-byte keys extracted from firmware binaries
+- 10 CCM nonce strategies (embedded, UID-derived, header-derived, fixed zeros, etc.)
+- Nonce lengths: 7, 8, 10, 11, 12, 13 bytes; MAC lengths: 4, 8, 16 bytes
+- Result: no valid decryptions — expected, since AES-CCM is not the tag cipher
 
-### Other ciphers tested
+### Other ciphers tested (all negative)
 
-- Single-byte XOR
-- Two-byte repeating XOR
-- TEA / XTEA
+- Single-byte XOR, two-byte repeating XOR
+- TEA / XTEA, SPECK / SIMON
 - RC4
-- AES-ECB / AES-CBC with various keys
+- AES-ECB / AES-CBC / AES-CTR / AES-CFB / AES-OFB
 
-None produced structured output matching the expected TLV format.
+### SAT solver attempts (by node-smartplay)
+
+- z3 (general-purpose SMT): timed out at >64 init rounds
+- CryptoMiniSat (crypto-optimized, native XOR clauses): ~90K variables, killed after 2+ hours
+- Conclusion: full 256-round Grain-128A resists SAT solvers even with 320 bits of constraint
 
 ## Key recovery options
 
-Since the key is in hardware, the remaining paths to obtain it are:
+Since the key is in the DA000001-01 ASIC silicon:
 
-1. **JTAG/debug access** — Read register `0x808904` from a running smart brick MCU. Requires physical access to debug pads on the PCB.
-2. **MITM the SmartAssist app** — Intercept traffic between the app and Bilbo backend. Less likely to yield the tag key: tags work on any brick globally, so the key is probably not reprovisioned per device via the app when docked; it is likely baked into the brick (e.g. OTP). Enigma might still be relevant for other keys (e.g. firmware signing).
-3. **Cloned tag + key brute force** — Write known plaintext to a blank tag (if the brick encrypts on write), then compare encrypted output to constrain key/nonce space. Requires understanding the write-side protocol.
-4. **Community collaboration** — Tags are the same globally and can be read by any smart brick, so the key is global (not per-device). Identical-payload evidence already suggests this. Anyone with debug access to one brick (e.g. JTAG read of 0x808904) can recover the key for all.
+1. **SPI bus sniffing** — Capture ASIC→EM9305 traffic during tag reads to obtain decrypted plaintext directly. Most practical hardware approach. Doesn't give the key but confirms plaintext structure.
+2. **Guess-and-determine attack** — ~2^64 complexity, theoretically feasible on a cloud GPU cluster over weeks/months. Uses the 320-bit keystream constraint.
+3. **Hardware side-channel** — Power/EM analysis of the ASIC during tag reads. The 256 init rounds leak information through power consumption patterns.
+4. **Silicon decapping** — Destructive microscopy of the ASIC die to read the key from ROM/OTP. Expensive and requires specialized equipment.
+5. **Community collaboration** — The key is global (all bricks, all tags). Anyone who extracts it from one ASIC recovers it for all.
+
+**Not viable:**
+
+- JTAG on the EM9305 — the tag decryption key is not in the EM9305
+- Firmware analysis — the EM9305 never handles encrypted tag data
+- Bilbo API interception — unlikely to yield the Grain-128A tag key (may yield BrickNet/ASIC-auth keys)
 
 ## What works without the key
 

@@ -1,31 +1,36 @@
 defmodule NfcDecrypt do
   @moduledoc """
-  Try to decrypt or find structure in LEGO Smart Tag payloads.
+  ARCHIVED — AES-CCM / generic cipher experiments for LEGO Smart Tag payloads.
+
+  ⚠ TAGS USE GRAIN-128A, NOT AES-CCM ⚠
+
+  The AES-CCM functions in the EM9305 firmware are for BrickNet PAwR session
+  encryption and EM9305↔ASIC mutual authentication — NOT tag decryption.
+  Tag data is encrypted with Grain-128A (ISO/IEC 29167-13) by the DA000001-01
+  ASIC. The EM9305 never sees encrypted tag data.
+
+  For active tag decryption work, see:
+    - GrainExperiments (mac_capture/lib/grain_experiments.ex)
+    - Grain128a        (mac_capture/lib/grain128a.ex)
+
+  This module is retained for:
+    - BrickNet AES-CCM analysis (if investigating brick-to-brick encryption)
+    - Historical reference of prior decryption strategies
 
   Tag EEPROM layout:
     Bytes 0-1:  Payload length (big-endian)
     Bytes 2-3:  0x01 0x0C (fixed, total tag capacity = 268 bytes)
-    Byte  4:    0x01 (fixed)
-    Byte  5+:   Encrypted blob (high entropy, ~6.4 bits/byte)
-
-  Expected plaintext layout after decryption (from firmware / node-smartplay HARDWARE.md; not verified —
-  we have not broken the encryption). Used as validation targets for decryption attempts:
-    byte[0:1]  Type ID (12-bit type + 2-bit block_type in bits 12-13)
-    byte[2:3]  Content length (uint16 LE)
-    byte[4:7]  Event type magic (uint32 LE). All known values accepted for validation:
-                 Identity / alias / presence: 0xA7E24ED1 (LE: D1 4E E2 A7)
-                 Item (tile):                0x0BBDA113 (LE: 13 A1 BD 0B)
-                 Play command:               0x812312DC (LE: DC 12 23 81)
-                 Distributed play (PAwR):    0x814A0D84 (LE: 84 0D 4A 81)
-                 Status/position:            0xE3B77171 (LE: 71 71 B7 E3)
+    Byte  4:    0x01 (format version)
+    Bytes 5-16: Per-content IV (96 bits, 12 bytes) for Grain-128A
+    Byte  17+:  Grain-128A ciphertext
 
   Run with:
     mix run -e "NfcDecrypt.run()"
     mix run -e "NfcDecrypt.run(\"data/hardware_md_tag_dumps.jsonl\")"
-    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 50_000)"  # CCM random-key brute (not ECB)
-    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 0)"       # skip random-key CCM
-    mix run -e "NfcDecrypt.run_v2()"                              # V2 only (corrected offset)
-    mix run -e "NfcDecrypt.run_aes_ccm()"                         # AES-CCM with firmware keys
+    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 50_000)"
+    mix run -e "NfcDecrypt.run(nil, aes_bruteforce_tries: 0)"
+    mix run -e "NfcDecrypt.run_v2()"
+    mix run -e "NfcDecrypt.run_aes_ccm()"                         # AES-CCM — BrickNet analysis only
   """
   import Bitwise
 
@@ -108,6 +113,7 @@ defmodule NfcDecrypt do
     IO.puts("Backfilled category in #{path} (#{length(lines)} lines)")
   end
 
+  @doc "ARCHIVED: generic cipher experiments. Tags use Grain-128A — see GrainExperiments."
   def run(jsonl_path \\ nil, opts \\ []) do
     {paths, raw} =
       if jsonl_path do
@@ -188,6 +194,7 @@ defmodule NfcDecrypt do
     run_v2_analysis(unique, opts)
   end
 
+  @doc "ARCHIVED: V2 analysis with corrected offset. Tags use Grain-128A — see GrainExperiments."
   def run_v2(jsonl_path \\ nil, _opts \\ []) do
     paths = if jsonl_path do
       [jsonl_path]
@@ -1992,14 +1999,19 @@ defmodule NfcDecrypt do
   end
 
   # ---------------------------------------------------------------------------
-  # AES-CCM decryption (the algorithm the firmware actually uses)
+  # AES-CCM decryption — BrickNet / ASIC mutual auth only (NOT tag encryption).
+  # Tags use Grain-128A. Retained for BrickNet analysis and historical reference.
   # ---------------------------------------------------------------------------
 
   @ccm_nonce_lengths [7, 8, 10, 11, 12, 13]
   @ccm_mac_lengths [4, 8, 16]
 
   @doc """
-  Main entry point for AES-CCM brute force.
+  ARCHIVED: AES-CCM brute force — targets BrickNet/ASIC-auth cipher, NOT tags.
+
+  Tags use Grain-128A (ISO/IEC 29167-13). For active tag decryption, see
+  GrainExperiments.run(). This function is retained for investigating
+  BrickNet PAwR encryption or as historical reference.
 
   AES-CCM is authenticated encryption: wrong keys are cryptographically rejected.
   No false positives are possible — a successful decryption is the real key.

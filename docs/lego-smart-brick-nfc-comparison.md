@@ -16,15 +16,17 @@ Comparison of two ISO 15693 (Type 5) dumps from the new LEGO smart brick system 
 
 ## NFC Chip Identification (from GET SYSTEM INFORMATION)
 
-| Field | Value |
-| ----- | ----- |
-| **Manufacturer** | EM Microelectronic (code 0x16) |
-| **IC reference** | 0x17 → EM4233 (2k-bit EEPROM, 96-bit crypto engine) |
-| **Memory** | 66 blocks × 4 bytes = 264 bytes |
-| **Security** | All blocks permanently write-locked (0x01) |
-| **Read access** | Open (no authentication required) |
 
-The tag chip is **NOT NXP** — it's made by **EM Microelectronic**. The EM4233 has a built-in 96-bit secret key crypto engine for privacy mode and 32-bit password protection, but the payload data is read-open.
+| Field            | Value                                                                                           |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| **Manufacturer** | EM Microelectronic (code 0x16)                                                                  |
+| **IC reference** | 0x17 → custom LEGO die (matches EM4237 with Grain-128A; **not** EM4233SLIC=0x02 or EM4233=0x09) |
+| **Memory**       | 66 blocks × 4 bytes = 264 bytes                                                                 |
+| **Security**     | All blocks permanently write-locked (0x01)                                                      |
+| **Read access**  | Open (no authentication required)                                                               |
+
+
+The tag chip is **NOT NXP** — it's made by **EM Microelectronic**. IC reference 0x17 matches the **EM4237**, which implements **Grain-128A** (ISO/IEC 29167-13) encryption. It is not an off-the-shelf EM4233 (IC ref 0x09) or EM4233SLIC (IC ref 0x02). The payload data is read-open (no authentication required).
 
 ## UID
 
@@ -78,16 +80,18 @@ So the header layout is **confirmed**: `[payload_len_hi, payload_len_lo, 0x01, 0
 
 ### Block 1 (first payload block) — format byte 0x01
 
-The **first byte of block 1** is always **`0x01`** in every known tag. If that byte were part of the CCM ciphertext, it would vary per tag (ciphertext is effectively random). So it is **not** encrypted — it is either cleartext or AAD (additional authenticated data). The decrypt/analysis code treats it as a **format/version byte**; the remaining 3 bytes of block 1 (and all of blocks 2–N) are the encrypted payload. So block 1 = **format byte `01` (in the clear) + first 3 bytes of ciphertext**.
+The **first byte of block 1** is always `**0x01`** in every known tag. If that byte were part of the ciphertext, it would vary per tag (ciphertext is effectively random). So it is **not** encrypted — it is a cleartext **format/version byte**. The remaining 3 bytes of block 1 are the start of the per-content IV (12 bytes total at bytes 5-16), followed by Grain-128A ciphertext. So block 1 = **format byte `01` (cleartext) + first 3 bytes of IV**.
 
 **Format-byte experiments** (NfcCustomClone → experiment 6): Change the first byte of block 1 and write to a blank; note whether the brick recognizes, ignores, or red-flashes.
 
-| Format byte | Result |
-| ----------- | ------ |
-| `0x01` (original) | Recognized. |
+
+| Format byte                                          | Result                                           |
+| ---------------------------------------------------- | ------------------------------------------------ |
+| `0x01` (original)                                    | Recognized.                                      |
 | `0x02` (Hyperdrive, block 1 `01391E39` → `02391E39`) | **Ignored** — brick does nothing (no red flash). |
-| `0x00` (Hyperdrive, block 1 → `00391E39`) | **Ignored.** |
-| `0xFF` (Hyperdrive, block 1 → `FF391E39`) | **Ignored.** |
+| `0x00` (Hyperdrive, block 1 → `00391E39`)            | **Ignored.**                                     |
+| `0xFF` (Hyperdrive, block 1 → `FF391E39`)            | **Ignored.**                                     |
+
 
 So the brick requires the format byte to be exactly `0x01`; any other value (0x00, 0x02, 0xFF) is treated like other invalid payloads (silent ignore, no red flash).
 
@@ -98,7 +102,7 @@ Experiments with `NfcCustomClone` (modified block 0 or payload) show how the bri
 - **Capacity (bytes 2–3 of block 0):** Must be exactly **0x010C** (268). X-Wing with capacity 112 (`006B0070`) was rejected; same 28 blocks with original capacity 268 (`006B010C`) was accepted. So the brick requires the fixed capacity value; changing it to the physical tag size breaks recognition.
 - **Payload length (bytes 0–1):** Must be non-zero and **exact**. Length 0 → tag ignored. Wrong but non-zero (e.g. 15 instead of 107) → brick **flashes red continuously** (distinct error). Off-by-one (106 or 108 instead of 107) → tag ignored (no red flash). So bytes 0–1 are interpreted as payload length; only a “very wrong” value triggers red flash.
 - **Payload length vs content ID:** X-Wing and Tie Fighter both have 0x006B (107) and 107-byte payloads; if bytes 0–1 were a content/type ID, two different items sharing the same value would be a coincidence — so the payload-length interpretation fits.
-- **Truncated payload:** Lightsaber truncated to 28 blocks with block 0 rewritten to match (payload 108, capacity 112) was written successfully but the brick **did not recognize** the tag. So fixing the header is not sufficient; the brick likely validates the full ciphertext (e.g. AES-CCM MAC).
+- **Truncated payload:** Lightsaber truncated to 28 blocks with block 0 rewritten to match (payload 108, capacity 112) was written successfully but the brick **did not recognize** the tag. So fixing the header is not sufficient; the ASIC likely validates ciphertext integrity (e.g. Grain-128A MAC or format check).
 - **Single-byte flip in ciphertext:** One bit flipped in a payload block → brick **ignores** the tag (no red flash). So MAC (or integrity) failure is silent, unlike a wrong header value which can trigger red flash.
 - **Swap headers:** Tie Fighter payload (28 blocks) with Vader’s block 0 (length 169) → ignored. Block 0 `FFFF010C` with 28 blocks → ignored. R2-D2 with length 75 instead of 74 → ignored.
 
@@ -116,7 +120,7 @@ Experiments with `NfcCustomClone` (modified block 0 or payload) show how the bri
 
 ## Encryption
 
-The payload (blocks 1–N) is **AES-128-CCM encrypted**. Confirmed by firmware disassembly. The encryption key is stored in a hardware register on the smart brick MCU, not in the firmware binary.
+The payload (blocks 1–N) is most likely encrypted with **Grain-128A** (ISO/IEC 29167-13), a lightweight stream cipher. Decryption is handled by the **DA000001-01 ASIC** on the smart brick — the EM9305 BLE SoC never sees encrypted tag data. The 128-bit key is in the ASIC silicon, not in the firmware binary. (The AES-CCM functions in the EM9305 firmware are for BrickNet PAwR / ASIC mutual authentication.)
 
 Critical finding: **two Vader tags with different UIDs have identical encrypted payloads**. This means the nonce is not UID-derived, the key is global, and all tags of the same type produce the same ciphertext. This makes byte-perfect cloning viable.
 
@@ -124,9 +128,7 @@ Full analysis: [encryption-analysis.md](encryption-analysis.md).
 
 ## Cloning implications
 
-Since tag data is openly readable, identical across same-type tags, and not UID-bound, **byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically. The blank need not be the same chip (EM4233); blanks with different UIDs or vendors work. Factory tags are write-locked; use blank stickers. For the practical workflow and which tags fit which sticker sizes, see [cloning-guide.md](cloning-guide.md).
-
-
+Since tag data is openly readable, identical across same-type tags, and not UID-bound, **byte-perfect cloning** to a blank writable ISO 15693 tag produces a tag the smart brick treats identically. The blank need not be the same chip (the LEGO tags use a custom EM die, not off-the-shelf EM4233); blanks with different UIDs or vendors work. Factory tags are write-locked; use blank stickers. For the practical workflow and which tags fit which sticker sizes, see [cloning-guide.md](cloning-guide.md).
 
 ## Tools
 
@@ -138,8 +140,6 @@ Since tag data is openly readable, identical across same-type tags, and not UID-
 ## Historical notes to “figure out how they work”
 
 1. **Payload (blocks 1–N)** — Likely binary blob (ID, type, maybe crypto). Look for repeated byte patterns, or try XOR/diff between two tags of the same type.
-
-
 
 ## What we did with only two tags
 

@@ -22,3 +22,8 @@
 /firmware/il2cpp/output/script.json
 /firmware/il2cpp/output/stringliteral.json
 /firmware/il2cpp/output/DummyDll/
+
+
+/crypto_attack/grain_attack
+/crypto_attack/*.o
+
